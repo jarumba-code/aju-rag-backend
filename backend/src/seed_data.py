@@ -7,6 +7,9 @@ Run from the backend directory:
 
 import asyncio
 import logging
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import settings
@@ -14,6 +17,7 @@ from src.db import Document, DocumentChunk, init_db, async_session
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
 logger = logging.getLogger(__name__)
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
 # ─── AJU Knowledge Base ───────────────────────────────────────────────────────
 
@@ -166,8 +170,8 @@ AJU_KNOWLEDGE = [
 # ─── Embedding & Seeding ──────────────────────────────────────────────────────
 
 client = AsyncOpenAI(
-    api_key=settings.OPENROUTER_API_KEY,
-    base_url=settings.OPENROUTER_BASE_URL,
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL"),
 )
 
 

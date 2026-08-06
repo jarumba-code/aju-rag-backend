@@ -6,6 +6,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
+from src.api.admin import router as admin_router
 from src.config import settings
 from src.db import init_db, get_db
 from src.rag import stream_rag_response, ingest_document
@@ -61,6 +62,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(admin_router)
 
 
 # ─── Request Schemas ─────────────────────────────────────────────────────────

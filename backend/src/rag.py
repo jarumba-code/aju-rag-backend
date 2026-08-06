@@ -1,21 +1,23 @@
 import io
-import uuid
 import logging
+import os
 from typing import AsyncGenerator
+
+from openai import AsyncOpenAI
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from openai import AsyncOpenAI
-from pgvector.sqlalchemy import Vector
+
 from src.config import settings
 from src.db import Document, DocumentChunk
 
 logger = logging.getLogger(__name__)
 
-# Initialize AsyncOpenAI client for OpenRouter
-openai_client = AsyncOpenAI(
-    api_key=settings.OPENROUTER_API_KEY,
-    base_url=settings.OPENROUTER_BASE_URL,
-)
+
+def get_openai_client() -> AsyncOpenAI:
+    return AsyncOpenAI(
+        api_key=os.getenv("OPENAI_API_KEY") or settings.OPENROUTER_API_KEY,
+        base_url=os.getenv("OPENAI_BASE_URL") or settings.OPENROUTER_BASE_URL,
+    )
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
@@ -75,7 +77,7 @@ async def get_embeddings(texts: list[str]) -> list[list[float]]:
     """
     if not texts:
         return []
-    response = await openai_client.embeddings.create(
+    response = await get_openai_client().embeddings.create(
         input=texts, model=settings.EMBEDDING_MODEL
     )
     return [item.embedding for item in response.data]
@@ -128,7 +130,7 @@ async def search_similar_chunks(
     Retrieves chunks from pgvector using cosine distance similarity.
     """
     # 1. Embed query
-    query_emb_resp = await openai_client.embeddings.create(
+    query_emb_resp = await get_openai_client().embeddings.create(
         input=[query], model=settings.EMBEDDING_MODEL
     )
     query_embedding = query_emb_resp.data[0].embedding
@@ -188,7 +190,7 @@ async def stream_rag_response(
     user_prompt = f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
     
     try:
-        response = await openai_client.chat.completions.create(
+        response = await get_openai_client().chat.completions.create(
             model=settings.DEFAULT_LLM_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
