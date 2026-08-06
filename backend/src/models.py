@@ -1,68 +1,121 @@
-import uuid
-from datetime import datetime, timezone
+import enum
+from sqlalchemy import Column, Integer, String, Text, DateTime, Enum, ForeignKey, Float, Boolean, JSON
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+from .database import Base
 
-from pgvector.sqlalchemy import Vector
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
-from sqlalchemy.ext.asyncio import AsyncAttrs
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+# --- ENUMS ---
+class VisibilityLevel(str, enum.Enum):
+    PUBLIC = "PUBLIC"
+    STUDENT = "STUDENT"
+    STAFF = "STAFF"
 
+class ContentStatus(str, enum.Enum):
+    DRAFT = "DRAFT"
+    PUBLISHED = "PUBLISHED"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
+    ARCHIVED = "ARCHIVED"
 
-class Base(DeclarativeBase, AsyncAttrs):
-    pass
+class ContentType(str, enum.Enum):
+    FAQ = "FAQ"
+    ARTICLE = "ARTICLE"
+    PDF = "PDF"
+    NOTICE = "NOTICE"
 
+# --- RELATIONAL TAXONOMY ---
+class Department(Base):
+    __tablename__ = "departments"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)  # e.g., "Information Technology Centre"
 
-class Document(Base):
-    """Master record for uploaded university documents."""
+class Category(Base):
+    __tablename__ = "categories"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)  # e.g., "Course Registration"
+    description = Column(String, nullable=True)
 
-    __tablename__ = "documents"
+# --- SYSTEM CONFIGURATION ---
+class SystemSetting(Base):
+    __tablename__ = "system_settings"
+    __table_args__ = {"extend_existing": True}
 
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    title: Mapped[str] = mapped_column(String(255), nullable=False)
-    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    file_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    department: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    doc_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    category: Mapped[str] = mapped_column(String(255), default="general")
-    uploaded_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        nullable=False,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        nullable=False,
-    )
-    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
-    source_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String, unique=True, nullable=False, index=True)
+    value = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    chunks: Mapped[list["DocumentChunk"]] = relationship(
-        "DocumentChunk",
-        back_populates="document",
-        cascade="all, delete-orphan",
-    )
+# --- CORE KNOWLEDGE ---
+class KnowledgeSource(Base):
+    __tablename__ = "knowledge_sources"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String, index=True)
+    content_type = Column(Enum(ContentType))
+    status = Column(Enum(ContentStatus), default=ContentStatus.DRAFT)
+    
+    # Relationships
+    department_id = Column(Integer, ForeignKey("departments.id"))
+    category_id = Column(Integer, ForeignKey("categories.id"))
+    
+    # Target Audience (Can be handled via association table for multiple, but simplified here)
+    visibility = Column(Enum(VisibilityLevel), index=True)
+    
+    # Temporal Controls (Scheduled Publishing & Expiry)
+    publish_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    department = relationship("Department")
+    category = relationship("Category")
+    chunks = relationship("DocumentChunk", back_populates="source", cascade="all, delete-orphan")
+    versions = relationship("KnowledgeVersion", back_populates="source")
 
+# --- VERSION HISTORY (The Git Model) ---
+class KnowledgeVersion(Base):
+    __tablename__ = "knowledge_versions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    source_id = Column(Integer, ForeignKey("knowledge_sources.id"))
+    version_number = Column(Integer)
+    content = Column(Text)  # The actual Notion-like rich text or parsed PDF text
+    edit_reason = Column(String)
+    edited_by = Column(String)  # Admin User ID
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    source = relationship("KnowledgeSource", back_populates="versions")
 
+# --- VECTOR CHUNKS ---
 class DocumentChunk(Base):
-    """Vector store table containing text chunks and OpenRouter embeddings."""
-
     __tablename__ = "document_chunks"
+    id = Column(Integer, primary_key=True)
+    source_id = Column(Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"))
+    chunk_content = Column(Text)
+    
+    # Replicated for High-Speed pgvector pre-filtering
+    visibility = Column(Enum(VisibilityLevel), index=True)
+    department_id = Column(Integer, index=True) 
+    
+    # vector_embedding = Column(Vector(1536))
+    source = relationship("KnowledgeSource", back_populates="chunks")
 
-    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    document_id: Mapped[str] = mapped_column(
-        String,
-        ForeignKey("documents.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(Vector(1536), nullable=False)
-    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
-        nullable=False,
-    )
+# --- ANALYTICS & FEEDBACK LOOPS ---
+class UnansweredQuestion(Base):
+    __tablename__ = "unanswered_questions"
+    id = Column(Integer, primary_key=True)
+    normalized_hash = Column(String, index=True)
+    sample_query = Column(Text)
+    hit_count = Column(Integer, default=1)
+    lowest_confidence = Column(Float)
+    ai_draft_suggested = Column(Text, nullable=True) # AI Draft Assistant Output
+    resolved = Column(Boolean, default=False)
 
-    document: Mapped["Document"] = relationship("Document", back_populates="chunks")
+class ChatAnalytics(Base):
+    __tablename__ = "chat_analytics"
+    id = Column(Integer, primary_key=True)
+    query = Column(Text)
+    response_time_ms = Column(Integer)
+    cache_hit = Column(Boolean)
+    similarity_score = Column(Float)
+    user_feedback = Column(Integer, nullable=True) # 1 for 👍, -1 for 👎
+    created_at = Column(DateTime(timezone=True), server_default=func.now())

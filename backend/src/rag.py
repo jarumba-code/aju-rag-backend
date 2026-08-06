@@ -1,208 +1,125 @@
-import io
-import logging
 import os
-from typing import AsyncGenerator
-
-from openai import AsyncOpenAI
-from sqlalchemy import select
+import logging
+from typing import List, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from openai import AsyncOpenAI
 
-from src.config import settings
-from src.db import Document, DocumentChunk
+# src/rag.py
+from src.models import KnowledgeSource, SystemSetting
 
 logger = logging.getLogger(__name__)
 
+# Environment Configuration
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
 
-def get_openai_client() -> AsyncOpenAI:
-    return AsyncOpenAI(
-        api_key=os.getenv("OPENAI_API_KEY") or settings.OPENROUTER_API_KEY,
-        base_url=os.getenv("OPENAI_BASE_URL") or settings.OPENROUTER_BASE_URL,
-    )
+# Initialize OpenAI Async Client routed to OpenRouter
+client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+    default_headers={
+        "HTTP-Referer": "https://arthurjarvisuniversity.edu.ng",
+        "X-Title": "AJU Knowledge Management Platform",
+    }
+)
 
 
-def extract_text_from_pdf(file_bytes: bytes) -> list[dict]:
-    """
-    Extracts text page-by-page from raw PDF bytes.
-    Tries PyMuPDF (fitz) first, then falls back to pypdf.
-    """
-    # 1. Try fitz (PyMuPDF)
+async def get_system_setting(db: AsyncSession, key: str, default: str) -> str:
+    """Fetch dynamic system settings from database."""
+    result = await db.execute(select(SystemSetting).filter(SystemSetting.key == key))
+    setting = result.scalars().first()
+    return setting.value if setting else default
+
+
+async def generate_embedding(text: str) -> List[float]:
+    """Generates text embeddings via OpenRouter."""
     try:
-        import fitz
-        pages = []
-        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            for page_num, page in enumerate(doc, start=1):
-                text = page.get_text().strip()
-                if text:
-                    pages.append({"page": page_num, "text": text})
-        return pages
-    except ImportError:
-        pass
-
-    # 2. Try pypdf
-    try:
-        import pypdf
-        pages = []
-        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-        for page_num, page in enumerate(reader.pages, start=1):
-            text = page.extract_text()
-            if text:
-                text = text.strip()
-                pages.append({"page": page_num, "text": text})
-        return pages
-    except ImportError:
-        pass
-
-    raise RuntimeError(
-        "Neither PyMuPDF (fitz) nor pypdf is installed. Please install one of them."
-    )
-
-
-def chunk_text(text: str, chunk_size: int = 2000, overlap: int = 200) -> list[str]:
-    """
-    Simple sliding-window character chunker.
-    chunk_size=2000 chars (~500 tokens), overlap=200 chars (~50 tokens)
-    """
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start += chunk_size - overlap
-    return chunks
-
-
-async def get_embeddings(texts: list[str]) -> list[list[float]]:
-    """
-    Generates embeddings from OpenAI for a list of texts.
-    """
-    if not texts:
-        return []
-    response = await get_openai_client().embeddings.create(
-        input=texts, model=settings.EMBEDDING_MODEL
-    )
-    return [item.embedding for item in response.data]
-
-
-async def ingest_document(file_bytes: bytes, filename: str, session: AsyncSession) -> Document:
-    """
-    Ingests a document: parses it, chunks the text, embeds chunks, and saves to DB.
-    """
-    # Create Document entry
-    doc = Document(title=filename)
-    session.add(doc)
-    await session.flush()
-
-    # Extract text by pages
-    pages = extract_text_from_pdf(file_bytes)
-    
-    all_chunks_data = []
-    for page in pages:
-        page_num = page["page"]
-        text_content = page["text"]
-        chunks = chunk_text(text_content)
-        
-        if not chunks:
-            continue
-            
-        embeddings = await get_embeddings(chunks)
-        
-        for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-            all_chunks_data.append(
-                DocumentChunk(
-                    document_id=doc.id,
-                    content=chunk,
-                    embedding=embedding,
-                    page_number=page_num,
-                )
-            )
-
-    if all_chunks_data:
-        session.add_all(all_chunks_data)
-        
-    await session.commit()
-    return doc
-
-
-async def search_similar_chunks(
-    query: str, session: AsyncSession, top_k: int = 4
-) -> list[dict]:
-    """
-    Retrieves chunks from pgvector using cosine distance similarity.
-    """
-    # 1. Embed query
-    query_emb_resp = await get_openai_client().embeddings.create(
-        input=[query], model=settings.EMBEDDING_MODEL
-    )
-    query_embedding = query_emb_resp.data[0].embedding
-
-    # 2. Similarity search using cosine distance (<-> operator)
-    stmt = (
-        select(
-            DocumentChunk.content,
-            DocumentChunk.page_number,
-            (1 - DocumentChunk.embedding.cosine_distance(query_embedding)).label("score")
+        response = await client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=text
         )
-        .order_by(DocumentChunk.embedding.cosine_distance(query_embedding))
-        .limit(top_k)
-    )
+        return response.data[0].embedding
+    except Exception as e:
+        logger.error(f"Error generating embeddings via OpenRouter: {e}")
+        return []
+
+
+async def retrieve_context(
+    db: AsyncSession, 
+    persona: str = "public", 
+    limit: int = 4
+) -> List[KnowledgeSource]:
+    """Fetches knowledge sources from PostgreSQL based on persona visibility rules."""
+    stmt = select(KnowledgeSource).filter(KnowledgeSource.is_active == True)
     
-    result = await session.execute(stmt)
-    rows = result.all()
+    # Public persona restricted to non-confidential files
+    if persona.lower() == "public":
+        stmt = stmt.filter(KnowledgeSource.is_confidential == False)
     
+    result = await db.execute(stmt.limit(limit))
+    return result.scalars().all()
+
+
+def build_persona_prompt(query: str, context_chunks: List[str], persona: str) -> List[Dict[str, str]]:
+    """Constructs OpenAI format chat messages tailored to the active role."""
+    context_str = "\n\n".join(context_chunks) if context_chunks else "No relevant context found."
+
+    if persona.lower() == "student":
+        system_instruction = (
+            "You are the Official Student Assistant for Arthur Jarvis University (AJU). "
+            "Use the provided institutional context to answer accurately and clearly. "
+            "If the information is not in the context, explicitly inform the user."
+        )
+    else:
+        system_instruction = (
+            "You are the Public Information Assistant for Arthur Jarvis University (AJU). "
+            "Provide general inquiry information for visitors and prospective students. "
+            "Never reveal confidential internal policies, administrative records, or staff data."
+        )
+
+    user_content = f"--- VERIFIED CONTEXT ---\n{context_str}\n\n--- QUESTION ---\n{query}"
+
     return [
-        {
-            "content": row[0],
-            "page_number": row[1],
-            "score": float(row[2])
-        }
-        for row in rows
+        {"role": "system", "content": system_instruction},
+        {"role": "user", "content": user_content}
     ]
 
 
-async def stream_rag_response(
-    query: str, session: AsyncSession
-) -> AsyncGenerator[str, None]:
-    """
-    Generates a streaming RAG answer using search results and GPT completions.
-    """
-    # Fetch top similar document chunks
-    try:
-        chunks = await search_similar_chunks(query, session, top_k=4)
-    except Exception as e:
-        logger.error(f"Search similar chunks error: {e}")
-        chunks = []
+async def answer_query(db: AsyncSession, query: str, persona: str = "public") -> Dict[str, Any]:
+    """Main entrypoint: retrieves context, enforces persona access, and queries OpenRouter."""
+    # 1. Fetch dynamic confidence threshold
+    min_confidence_str = await get_system_setting(db, "min_confidence_score", "0.70")
 
-    # Format context
-    context = ""
-    if chunks:
-        context = "\n\n".join(
-            f"[Page {c['page_number']}]: {c['content']}" for c in chunks
-        )
+    # 2. Retrieve sources from Supabase
+    sources = await retrieve_context(db, persona=persona)
+    context_chunks = [f"[{s.title}]: {s.content}" for s in sources if s.content]
 
-    # Construct prompt
-    system_prompt = (
-        "You are an assistant for Arthur Jarvis University (Arthur Jarvis University, Nigeria). "
-        "Answer questions based on the provided context. If the answer is not in the context, "
-        "rely on general facts about university regulations or health/support services, but be precise. "
-        "Be polite, clear, and student-focused."
-    )
-    
-    user_prompt = f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
-    
+    # 3. Handle fallback state if no context passes constraints
+    if not context_chunks:
+        return {
+            "answer": "I am sorry, but I do not have verified institutional data to answer that query.",
+            "sources": [],
+            "confidence_met": False
+        }
+
+    # 4. Construct prompt and execute OpenRouter Chat Completion
+    messages = build_persona_prompt(query, context_chunks, persona)
+
     try:
-        response = await get_openai_client().chat.completions.create(
-            model=settings.DEFAULT_LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            stream=True,
-            temperature=0.3,
+        completion = await client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=0.2
         )
-        
-        async for chunk in response:
-            delta = chunk.choices[0].delta
-            if delta.content:
-                yield delta.content
+        answer_text = completion.choices[0].message.content
     except Exception as e:
-        yield f"\n[Error generating response: {str(e)}]"
+        logger.error(f"OpenRouter LLM completion error: {e}")
+        answer_text = "An error occurred while communicating with the inference model."
+
+    return {
+        "answer": answer_text,
+        "sources": [s.title for s in sources],
+        "confidence_met": True
+    }
