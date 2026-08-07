@@ -2,6 +2,7 @@ import enum
 from sqlalchemy import Column, Integer, String, Text, DateTime, Enum, ForeignKey, Float, Boolean, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
+from pgvector.sqlalchemy import Vector
 from .database import Base
 
 # --- ENUMS ---
@@ -39,10 +40,9 @@ class SystemSetting(Base):
     __tablename__ = "system_settings"
     __table_args__ = {"extend_existing": True}
 
-    id = Column(Integer, primary_key=True, index=True)
-    key = Column(String, unique=True, nullable=False, index=True)
-    value = Column(Text, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    key = Column(String, primary_key=True, index=True)
+    value = Column(String, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now())
 
 # --- CORE KNOWLEDGE ---
 class KnowledgeSource(Base):
@@ -94,9 +94,11 @@ class DocumentChunk(Base):
     
     # Replicated for High-Speed pgvector pre-filtering
     visibility = Column(Enum(VisibilityLevel), index=True)
-    department_id = Column(Integer, index=True) 
-    
-    # vector_embedding = Column(Vector(1536))
+    department_id = Column(Integer, index=True)
+
+    # 1536-dim embedding from text-embedding-3-small
+    vector_embedding = Column(Vector(1536), nullable=True)
+
     source = relationship("KnowledgeSource", back_populates="chunks")
 
 # --- ANALYTICS & FEEDBACK LOOPS ---

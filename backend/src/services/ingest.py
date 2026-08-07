@@ -1,123 +1,241 @@
-import hashlib
-import io
+"""
+Ingestion pipeline: chunking, embedding, and persistence for the AJU RAG system.
+
+Pipeline:
+  Raw Text -> Recursive Character Splitter (800 chars, 100 overlap)
+           -> Batched OpenRouter Embedding (text-embedding-3-small, 1536-dim)
+           -> Bulk insert into document_chunks with replicated visibility & department_id
+"""
+
 import logging
 import os
-from pathlib import Path
-from typing import Any
+from typing import List, Optional
 
-import pypdf
 from dotenv import load_dotenv
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import AsyncOpenAI
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.models import Document, DocumentChunk
+from src.models import DocumentChunk, KnowledgeSource, ContentStatus, VisibilityLevel
+
+load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
-load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
 
-client = AsyncOpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    base_url=os.getenv("OPENAI_BASE_URL"),
+# ---------------------------------------------------------------------------
+# OpenRouter embedding client (shared config with rag.py)
+# ---------------------------------------------------------------------------
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
+
+_embedding_client = AsyncOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+    default_headers={
+        "HTTP-Referer": "https://arthurjarvisuniversity.edu.ng",
+        "X-Title": "AJU Knowledge Management Platform",
+    },
 )
 
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1500,
-    chunk_overlap=150,
-    separators=["\n\n", "\n", " ", ""],
-)
+# ---------------------------------------------------------------------------
+# 1. Recursive Character Splitter
+# ---------------------------------------------------------------------------
+_DEFAULT_SEPARATORS = ["\n\n", "\n", ". ", " ", ""]
 
 
-def compute_sha256(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def recursive_chunk_text(
+    text: str,
+    chunk_size: int = 800,
+    overlap: int = 100,
+    separators: Optional[List[str]] = None,
+) -> List[str]:
+    """
+    Split *text* into overlapping chunks using a recursive separator strategy.
+
+    Tries each separator in order; when a split produces pieces smaller than
+    *chunk_size* they are kept as-is, otherwise the next separator is tried
+    on the oversized fragment.
+
+    Returns a flat list of chunk strings, each ≤ *chunk_size* characters
+    (best-effort — a single word longer than *chunk_size* is kept whole).
+    """
+    if separators is None:
+        separators = _DEFAULT_SEPARATORS
+
+    if not text or not text.strip():
+        return []
+
+    chunks: List[str] = []
+    _recursive_split(text.strip(), chunk_size, overlap, separators, 0, chunks)
+    return chunks
 
 
-def extract_text_from_pdf(file_bytes: bytes) -> list[dict[str, Any]]:
-    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-    pages: list[dict[str, Any]] = []
-    for page_number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
+def _recursive_split(
+    text: str,
+    chunk_size: int,
+    overlap: int,
+    separators: List[str],
+    sep_idx: int,
+    out: List[str],
+) -> None:
+    """Internal recursive helper."""
+    # Base case: text fits in one chunk
+    if len(text) <= chunk_size:
         if text.strip():
-            pages.append({"page": page_number, "text": text.strip()})
-    return pages
+            out.append(text.strip())
+        return
+
+    # If we've exhausted separators, hard-split by character window
+    if sep_idx >= len(separators):
+        start = 0
+        while start < len(text):
+            end = min(start + chunk_size, len(text))
+            fragment = text[start:end].strip()
+            if fragment:
+                out.append(fragment)
+            start += chunk_size - overlap
+        return
+
+    sep = separators[sep_idx]
+    parts = text.split(sep) if sep else list(text)
+
+    current_chunk = ""
+    for part in parts:
+        candidate = (current_chunk + sep + part) if current_chunk else part
+
+        if len(candidate) <= chunk_size:
+            current_chunk = candidate
+        else:
+            # Flush current_chunk
+            if current_chunk.strip():
+                if len(current_chunk) <= chunk_size:
+                    out.append(current_chunk.strip())
+                else:
+                    _recursive_split(current_chunk, chunk_size, overlap, separators, sep_idx + 1, out)
+
+            # If the new part itself is oversized, recurse deeper
+            if len(part) > chunk_size:
+                _recursive_split(part, chunk_size, overlap, separators, sep_idx + 1, out)
+                current_chunk = ""
+            else:
+                current_chunk = part
+
+    # Flush remaining
+    if current_chunk.strip():
+        if len(current_chunk) <= chunk_size:
+            out.append(current_chunk.strip())
+        else:
+            _recursive_split(current_chunk, chunk_size, overlap, separators, sep_idx + 1, out)
+
+    # Apply overlap: prepend tail of previous chunk to the next chunk
+    if overlap > 0 and len(out) > 1:
+        merged: List[str] = [out[0]]
+        for i in range(1, len(out)):
+            prev_tail = merged[-1][-overlap:]
+            # Only prepend if it doesn't duplicate the start of the next chunk
+            if not out[i].startswith(prev_tail):
+                merged.append(prev_tail + " " + out[i])
+            else:
+                merged.append(out[i])
+        out.clear()
+        out.extend(merged)
 
 
-async def embed_texts(texts: list[str], openai_client: AsyncOpenAI | None = None) -> list[list[float]]:
+# ---------------------------------------------------------------------------
+# 2. Async Batched Embedding Generation
+# ---------------------------------------------------------------------------
+EMBEDDING_BATCH_SIZE = 64  # OpenRouter / OpenAI supports up to ~2048 inputs
+
+
+async def generate_embeddings(texts: List[str]) -> List[List[float]]:
+    """
+    Generate 1536-dim embeddings for a list of texts via OpenRouter.
+    Processes in batches of EMBEDDING_BATCH_SIZE to respect API limits.
+
+    Returns a list of embedding vectors (one per input text).
+    """
     if not texts:
         return []
-    embedding_client = openai_client or client
-    response = await embedding_client.embeddings.create(
-        model=os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small"),
-        input=texts,
-    )
-    return [item.embedding for item in response.data]
 
+    all_embeddings: List[List[float]] = []
 
-async def process_and_ingest_pdf(
-    session: AsyncSession,
-    openai_client: AsyncOpenAI,
-    file_bytes: bytes,
-    filename: str,
-    department: str | None = None,
-    doc_type: str | None = None,
-) -> Document:
-    if not file_bytes:
-        raise ValueError("Uploaded file is empty.")
-    if not filename.lower().endswith(".pdf"):
-        raise ValueError("Only PDF files are supported.")
-
-    source_hash = compute_sha256(file_bytes)
-
-    existing_result = await session.execute(
-        select(Document).where(Document.file_hash == source_hash)
-    )
-    existing_doc = existing_result.scalar_one_or_none()
-    if existing_doc is not None:
-        raise ValueError("A document with the same content already exists.")
-
-    document = Document(
-        title=filename,
-        filename=filename,
-        file_hash=source_hash,
-        department=department,
-        doc_type=doc_type or "general",
-        category=department or "general",
-        source_hash=source_hash,
-        source_name=filename,
-    )
-    session.add(document)
-    await session.flush()
-
-    pages = extract_text_from_pdf(file_bytes)
-    if not pages:
-        raise ValueError("No readable text could be extracted from the PDF.")
-
-    chunk_texts: list[str] = []
-    chunk_meta: list[dict[str, Any]] = []
-    for page in pages:
-        chunks = splitter.split_text(page["text"])
-        for chunk in chunks:
-            chunk_texts.append(chunk)
-            chunk_meta.append({"page_number": page["page"]})
-
-    if chunk_texts:
-        embeddings = await embed_texts(chunk_texts, openai_client)
-        for chunk, embedding, meta in zip(chunk_texts, embeddings, chunk_meta):
-            session.add(
-                DocumentChunk(
-                    document_id=document.id,
-                    content=chunk,
-                    embedding=embedding,
-                    page_number=meta["page_number"],
-                )
+    for batch_start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch = texts[batch_start : batch_start + EMBEDDING_BATCH_SIZE]
+        try:
+            response = await _embedding_client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input=batch,
             )
+            # Sort by index to guarantee order matches input
+            sorted_data = sorted(response.data, key=lambda d: d.index)
+            all_embeddings.extend([item.embedding for item in sorted_data])
+        except Exception as e:
+            logger.error(
+                f"Embedding batch failed (items {batch_start}-"
+                f"{batch_start + len(batch)}): {e}"
+            )
+            # Insert empty vectors so indices stay aligned
+            all_embeddings.extend([[] for _ in batch])
 
-    document.chunk_count = len(chunk_texts)
-    await session.commit()
-    await session.refresh(document)
-    return document
+    return all_embeddings
 
 
-async def ingest_document(file_bytes: bytes, filename: str, session: AsyncSession) -> Document:
-    return await process_and_ingest_pdf(session, client, file_bytes, filename)
+# ---------------------------------------------------------------------------
+# 3. Full Ingestion Pipeline
+# ---------------------------------------------------------------------------
+
+async def process_and_store_document(
+    db: AsyncSession,
+    source_id: int,
+    content: str,
+    visibility: VisibilityLevel,
+    department_id: Optional[int] = None,
+) -> int:
+    """
+    End-to-end ingestion pipeline for a single document.
+
+    1. Chunks the raw text with recursive splitting.
+    2. Generates batched embeddings via OpenRouter.
+    3. Bulk inserts DocumentChunk rows with replicated visibility & department_id.
+    4. Updates the parent KnowledgeSource status to PUBLISHED.
+
+    Returns the number of chunks created.
+    """
+    # --- Step 1: Chunk ---
+    chunks = recursive_chunk_text(content, chunk_size=800, overlap=100)
+    if not chunks:
+        logger.warning(f"Source {source_id}: no chunks produced from content.")
+        return 0
+
+    logger.info(f"Source {source_id}: split into {len(chunks)} chunks.")
+
+    # --- Step 2: Embed (fire-and-forget for now — vectors stored when pgvector is ready) ---
+    embeddings = await generate_embeddings(chunks)
+    logger.info(f"Source {source_id}: generated {len(embeddings)} embeddings.")
+
+    # --- Step 3: Bulk persist chunks ---
+    chunk_objects = [
+        DocumentChunk(
+            source_id=source_id,
+            chunk_content=chunk_text,
+            visibility=visibility,
+            department_id=department_id,
+            vector_embedding=embedding if embedding else None,
+        )
+        for chunk_text, embedding in zip(chunks, embeddings)
+    ]
+    db.add_all(chunk_objects)
+
+    # --- Step 4: Mark source as PUBLISHED ---
+    from sqlalchemy import update
+
+    await db.execute(
+        update(KnowledgeSource)
+        .where(KnowledgeSource.id == source_id)
+        .values(status=ContentStatus.PUBLISHED)
+    )
+
+    await db.commit()
+    logger.info(
+        f"Source {source_id}: persisted {len(chunk_objects)} chunks, status → PUBLISHED."
+    )
+    return len(chunk_objects)
