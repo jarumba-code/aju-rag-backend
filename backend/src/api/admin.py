@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db import get_db
+from src.databasetabase import get_db
 from src.models import Document
 from src.services.ingest import client as openai_client, process_and_ingest_pdf
 

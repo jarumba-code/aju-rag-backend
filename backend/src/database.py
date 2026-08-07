@@ -1,37 +1,63 @@
-import os
+from pathlib import Path
+from urllib.parse import urlparse
+
 from dotenv import load_dotenv
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import declarative_base
 
-# Force-load environment variables from backend/.env
-load_dotenv()
+from src.config import settings
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+ENV_FILE = BACKEND_DIR / ".env"
 
+load_dotenv(dotenv_path=ENV_FILE, override=False)
+
+
+def _mask_database_url(database_url: str) -> str:
+    parsed = urlparse(database_url)
+    username = parsed.username or ""
+    password = parsed.password or ""
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    database = parsed.path.lstrip("/")
+    driver = parsed.scheme
+    if username and password:
+        return f"{driver}://{username}:********@{host}{port}/{database}"
+    if username:
+        return f"{driver}://{username}@{host}{port}/{database}"
+    return f"{driver}://{host}{port}/{database}"
+
+
+DATABASE_URL = settings.get_database_url().strip().strip('"').strip("'")
 if not DATABASE_URL:
     raise ValueError("🚨 DATABASE_URL environment variable is missing or failed to load. Check backend/.env")
 
-# Convert standard Postgres protocol to asyncpg for async SQLAlchemy
 if DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-# Initialize Async Engine
+print(f".env file loaded from: {ENV_FILE}")
+print("Loaded DATABASE_URL:")
+print(_mask_database_url(DATABASE_URL))
+print(f"Hostname: {urlparse(DATABASE_URL).hostname}")
+print(f"Username: {urlparse(DATABASE_URL).username}")
+print(f"Database: {urlparse(DATABASE_URL).path.lstrip('/')}")
+print(f"Driver: {urlparse(DATABASE_URL).scheme}")
+
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
-    pool_pre_ping=True
+    pool_pre_ping=True,
+    connect_args={"statement_cache_size": 0},
 )
 
-# Async Session Generator Factory
 AsyncSessionLocal = async_sessionmaker(
     bind=engine,
     class_=AsyncSession,
     expire_on_commit=False,
     autocommit=False,
-    autoflush=False
+    autoflush=False,
 )
 
-# Base class for database models
 Base = declarative_base()
 
 
