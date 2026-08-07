@@ -1,271 +1,235 @@
-"""
-RAG Query Engine for Arthur Jarvis University Knowledge Platform.
-
-Pipeline:
-  Query Text -> Embedding -> pgvector cosine similarity search -> LLM completion
-"""
-
-import os
+import asyncio
 import logging
-from typing import List, Dict, Any, Optional
+import os
+import re
+import uuid
+from typing import Any, Dict, List, Optional
 
-from dotenv import load_dotenv
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from sqlalchemy import or_
 from openai import AsyncOpenAI
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.models import DocumentChunk, KnowledgeSource, SystemSetting, ContentStatus, VisibilityLevel
-from src.services.ingest import generate_embeddings
+from src.database import AsyncSessionLocal
+from src.models import ChatMessage, Conversation, KnowledgeSource, SystemSetting, UnansweredQuery
 
-load_dotenv(override=True)
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# OpenRouter LLM client
-# ---------------------------------------------------------------------------
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "google/gemini-2.5-flash")
-
-client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-    default_headers={
-        "HTTP-Referer": "https://arthurjarvisuniversity.edu.ng",
-        "X-Title": "AJU Knowledge Management Platform",
-    },
-)
-
-# ---------------------------------------------------------------------------
-# Persona System Prompts
-# ---------------------------------------------------------------------------
-PERSONA_PROMPTS: Dict[str, str] = {
-    "public": (
-        "You are the Official Public Information Assistant for Arthur Jarvis University (AJU), "
-        "Nigeria. Your role is to serve prospective students, parents, and general visitors on the "
-        "main university website.\n\n"
-        "Tone: Welcoming, professional, and informative.\n"
-        "Scope: ONLY provide information visible to the general public — admission requirements, "
-        "programmes offered, campus life, contact information, and institutional news.\n"
-        "Restrictions: NEVER reveal student records, internal policies, fee structures marked "
-        "confidential, staff HR data, or any content marked as STUDENT or STAFF visibility.\n"
-        "If a question falls outside your scope, politely guide the user to contact the relevant "
-        "AJU office directly."
-    ),
-    "student": (
-        "You are the Official Student Portal Assistant for Arthur Jarvis University (AJU), Nigeria. "
-        "Your role is to support enrolled students navigating the student portal and administrative "
-        "processes.\n\n"
-        "Tone: Clear, direct, and step-by-step. Assume the user is a registered AJU student.\n"
-        "Scope: Course registration, fee payment and clearance, exam clearance, portal login issues, "
-        "result checking, accommodation booking, and departmental queries.\n"
-        "When answering: Break down procedures into numbered steps wherever possible. "
-        "Mention relevant portal menus or offices where applicable.\n"
-        "If the information is not in the provided context, explicitly say so and direct the student "
-        "to the appropriate office or portal section."
-    ),
-    "staff": (
-        "You are the Internal Staff Knowledge Assistant for Arthur Jarvis University (AJU), Nigeria. "
-        "Your role is to assist academic and administrative staff with institutional processes.\n\n"
-        "Tone: Professional and concise.\n"
-        "Scope: All visibility levels including STAFF-only content such as HR policies, internal "
-        "memos, administrative procedures, and departmental guidelines.\n"
-        "Provide accurate, direct answers based on the verified institutional context provided."
-    ),
-}
+LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3.3-70b-instruct")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
 
 
-# ---------------------------------------------------------------------------
-# Utility: Fetch a system setting from DB with fallback
-# ---------------------------------------------------------------------------
-async def get_system_setting(db: AsyncSession, key: str, default: str) -> str:
-    """Fetch a dynamic setting from the system_settings table."""
-    result = await db.execute(
-        select(SystemSetting).filter(SystemSetting.key == key)
+def get_openai_client() -> AsyncOpenAI:
+    return AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=OPENROUTER_API_KEY,
+        default_headers={
+            "HTTP-Referer": "https://arthurjarvisuniversity.edu.ng",
+            "X-Title": "AJU Knowledge Management Platform",
+        },
     )
+
+
+async def get_system_setting(db: AsyncSession, key: str, default: str) -> str:
+    """Fetch dynamic system settings from database."""
+    result = await db.execute(select(SystemSetting).filter(SystemSetting.key == key))
     setting = result.scalars().first()
     return setting.value if setting else default
 
 
-# ---------------------------------------------------------------------------
-# Step 1: Retrieve relevant chunks via pgvector cosine similarity
-# ---------------------------------------------------------------------------
 async def retrieve_relevant_chunks(
     db: AsyncSession,
-    query_text: str,
-    persona: str,
+    query: str,
+    persona: str = "public",
     department_id: Optional[int] = None,
-    limit: int = 5,
-) -> List[DocumentChunk]:
-    """
-    Embed the query and run a pgvector cosine similarity search against document_chunks.
+    limit: int = 4,
+) -> List[KnowledgeSource]:
+    """Retrieve a small set of knowledge sources relevant to the incoming query."""
+    stmt = select(KnowledgeSource)
+    if department_id is not None:
+        stmt = stmt.filter(KnowledgeSource.department_id == department_id)
 
-    Visibility rules:
-      - public  → only PUBLIC chunks
-      - student → PUBLIC + STUDENT chunks
-      - staff   → PUBLIC + STUDENT + STAFF chunks
+    result = await db.execute(stmt.limit(limit))
+    sources = result.scalars().all()
 
-    Optionally filters by department_id (matches specified dept OR NULL dept).
-    Returns the top-k most similar DocumentChunk rows ordered by cosine distance.
-    """
-    # 1. Generate query embedding
-    embeddings = await generate_embeddings([query_text])
-    if not embeddings or not embeddings[0]:
-        logger.warning("Failed to generate query embedding — returning empty context.")
+    if not sources:
         return []
 
-    query_vector = embeddings[0]
+    keywords = [word.lower() for word in query.split() if word.isalnum()]
+    if not keywords:
+        return sources[:limit]
 
-    # 2. Build visibility filter
-    persona_lower = persona.lower()
-    if persona_lower == "public":
-        visibility_filter = DocumentChunk.visibility == VisibilityLevel.PUBLIC
-    elif persona_lower == "student":
-        visibility_filter = DocumentChunk.visibility.in_([
-            VisibilityLevel.PUBLIC, VisibilityLevel.STUDENT
-        ])
-    else:  # staff or any other elevated role
-        visibility_filter = DocumentChunk.visibility.in_([
-            VisibilityLevel.PUBLIC, VisibilityLevel.STUDENT, VisibilityLevel.STAFF
-        ])
+    scored_sources: List[tuple[int, KnowledgeSource]] = []
+    for source in sources:
+        haystack = " ".join(
+            filter(None, [source.title, getattr(source, "content", None), getattr(source, "content_type", None)])
+        ).lower()
+        score = sum(1 for keyword in keywords if keyword in haystack)
+        scored_sources.append((score, source))
 
-    # 3. Build base query — cosine distance (<=> operator), only chunks WITH embeddings
-    stmt = (
-        select(DocumentChunk)
-        .where(DocumentChunk.vector_embedding.isnot(None))
-        .where(visibility_filter)
-        .order_by(
-            DocumentChunk.vector_embedding.op("<=>")(query_vector)
-        )
-        .limit(limit)
-    )
+    scored_sources.sort(key=lambda item: item[0], reverse=True)
+    return [source for _, source in scored_sources[:limit]]
 
-    # 4. Optionally scope by department (match specified dept OR unassigned chunks)
-    if department_id is not None:
-        stmt = stmt.where(
-            or_(
-                DocumentChunk.department_id == department_id,
-                DocumentChunk.department_id.is_(None),
+
+def normalize_query_text(text: str) -> str:
+    normalized = text.lower()
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+async def log_unanswered_query(
+    query_text: str,
+    normalized_query: str,
+    reason: str,
+    confidence_score: Optional[float],
+    retrieved_documents: int,
+    conversation_id: Optional[uuid.UUID] = None,
+    user_id: Optional[uuid.UUID] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        async with AsyncSessionLocal() as session:
+            unanswered = UnansweredQuery(
+                query_text=query_text,
+                normalized_query=normalized_query,
+                reason=reason,
+                confidence_score=confidence_score,
+                retrieved_documents=retrieved_documents,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                metadata=metadata,
             )
-        )
-
-    result = await db.execute(stmt)
-    chunks = result.scalars().all()
-    logger.info(
-        f"retrieve_relevant_chunks: persona={persona}, dept={department_id}, "
-        f"returned {len(chunks)} chunks."
-    )
-    return chunks
+            session.add(unanswered)
+            await session.commit()
+    except Exception as exc:
+        logger.warning("Failed to log unanswered query: %s", exc)
 
 
-# ---------------------------------------------------------------------------
-# Step 2: Generate RAG response from retrieved chunks + LLM
-# ---------------------------------------------------------------------------
 async def generate_rag_response(
     db: AsyncSession,
     query: str,
     persona: str = "public",
     department_id: Optional[int] = None,
+    conversation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Full RAG pipeline:
-      1. Retrieve top-k chunks via pgvector similarity.
-      2. If no chunks found, return polite fallback.
-      3. Format context and call LLM via OpenRouter.
-      4. Return answer + sources metadata.
-    """
-    # 1. Retrieve chunks
-    chunks = await retrieve_relevant_chunks(
-        db=db,
-        query_text=query,
-        persona=persona,
-        department_id=department_id,
-        limit=5,
+    """Generate a persona-aware response and persist the conversation history."""
+    conversation = None
+    if conversation_id:
+        try:
+            conversation_uuid = uuid.UUID(conversation_id)
+        except ValueError:
+            conversation_uuid = None
+        if conversation_uuid:
+            result = await db.execute(select(Conversation).where(Conversation.id == conversation_uuid))
+            conversation = result.scalars().first()
+
+    if conversation is None:
+        conversation = Conversation(persona=persona, department_id=department_id)
+        db.add(conversation)
+        await db.flush()
+
+    history_result = await db.execute(
+        select(ChatMessage)
+        .where(ChatMessage.conversation_id == conversation.id)
+        .order_by(ChatMessage.created_at.asc())
+        .limit(6)
     )
+    history = history_result.scalars().all()
 
-    # 2. Fallback if no relevant context found
-    if not chunks:
-        fallback_msg = (
-            "I'm sorry, I don't have verified institutional information to answer that query. "
-            "Please contact the relevant AJU office directly or visit the official website at "
-            "www.arthurjarvisuniversity.edu.ng."
-        )
-        return {
-            "answer": fallback_msg,
-            "sources": [],
-            "confidence_met": False,
-        }
+    sources = await retrieve_relevant_chunks(db, query=query, persona=persona, department_id=department_id)
+    context_chunks = [
+        f"[{getattr(source, 'title', 'Knowledge')}]: {getattr(source, 'content', getattr(source, 'content_type', ''))}"
+        for source in sources
+        if getattr(source, 'content', None) or getattr(source, 'title', None)
+    ]
 
-    # 3. Build context string from chunks
-    context_parts = []
-    for i, chunk in enumerate(chunks, 1):
-        context_parts.append(f"[Context {i}]:\n{chunk.chunk_content}")
-    context_str = "\n\n".join(context_parts)
+    message_history = [
+        {"role": msg.role, "content": msg.content}
+        for msg in history
+        if msg.role in {"user", "assistant"}
+    ]
 
-    # 4. Select persona system prompt
-    system_prompt = PERSONA_PROMPTS.get(persona.lower(), PERSONA_PROMPTS["public"])
+    system_instruction = (
+        "You are the assistant for Arthur Jarvis University. Use the retrieved context to answer the user. "
+        "If the information is not provided in the context, say so clearly."
+    )
+    context_str = "\n\n".join(context_chunks) if context_chunks else "No relevant context found."
 
     messages = [
-        {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": (
-                f"--- VERIFIED INSTITUTIONAL CONTEXT ---\n{context_str}\n\n"
-                f"--- STUDENT/USER QUESTION ---\n{query}\n\n"
-                "Answer strictly based on the context above. "
-                "If the context does not contain a clear answer, say so honestly."
-            ),
-        },
+        {"role": "system", "content": f"{system_instruction}\n\nContext:\n{context_str}"},
+        *message_history,
+        {"role": "user", "content": query},
     ]
 
-    # 5. Call LLM
+    gap_reason: Optional[str] = None
+    confidence_score: Optional[float] = None
+    retrieved_documents = len(sources)
+    normalized_query = normalize_query_text(query)
+
+    if not sources:
+        gap_reason = "no_sources"
+    
     try:
-        completion = await client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=1024,
-        )
+        client = get_openai_client()
+        completion = await client.chat.completions.create(model=LLM_MODEL, messages=messages, temperature=0.2)
         answer_text = completion.choices[0].message.content or ""
-    except Exception as e:
-        logger.error(f"LLM completion error: {e}")
-        answer_text = "An error occurred while generating the response. Please try again."
+    except Exception as exc:
+        logger.error("OpenRouter LLM completion error: %s", exc)
+        answer_text = "An error occurred while communicating with the inference model."
+        gap_reason = gap_reason or "llm_refused"
 
-    # 6. Build sources metadata
-    sources = [
-        {
-            "chunk_id": chunk.id,
-            "source_id": chunk.source_id,
-            "visibility": chunk.visibility.value if chunk.visibility else None,
-        }
-        for chunk in chunks
-    ]
+    # Rough confidence estimate based on context availability
+    if not gap_reason and not context_chunks:
+        gap_reason = "low_confidence"
+        confidence_score = 0.0
+    elif not gap_reason:
+        confidence_score = 1.0
+
+    if gap_reason:
+        asyncio.create_task(
+            log_unanswered_query(
+                query_text=query,
+                normalized_query=normalized_query,
+                reason=gap_reason,
+                confidence_score=confidence_score,
+                retrieved_documents=retrieved_documents,
+                conversation_id=conversation.id if conversation else None,
+                user_id=None,
+                metadata={"context_count": len(context_chunks)},
+            )
+        )
+
+    user_message = ChatMessage(conversation_id=conversation.id, role="user", content=query)
+    assistant_message = ChatMessage(
+        conversation_id=conversation.id,
+        role="assistant",
+        content=answer_text,
+        sources=[source.title for source in sources if getattr(source, "title", None)],
+    )
+    db.add_all([user_message, assistant_message])
+    await db.commit()
 
     return {
         "answer": answer_text,
-        "sources": sources,
-        "confidence_met": True,
+        "sources": [source.title for source in sources if getattr(source, "title", None)],
+        "conversation_id": str(conversation.id),
+        "confidence_met": bool(context_chunks),
     }
 
 
-# ---------------------------------------------------------------------------
-# Legacy shim — keeps the existing /api/v1/query endpoint working
-# ---------------------------------------------------------------------------
 async def answer_query(
     db: AsyncSession,
     query: str,
     persona: str = "public",
     department_id: Optional[int] = None,
+    conversation_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Thin wrapper around generate_rag_response for backward compatibility."""
-    result = await generate_rag_response(
+    """Backward-compatible wrapper around generate_rag_response."""
+    return await generate_rag_response(
         db=db,
         query=query,
         persona=persona,
         department_id=department_id,
+        conversation_id=conversation_id,
     )
-    # Normalise sources to List[str] for the existing QueryResponse schema
-    raw_sources = result.get("sources", [])
-    if raw_sources and isinstance(raw_sources[0], dict):
-        result["sources"] = [str(s["source_id"]) for s in raw_sources]
-    return result

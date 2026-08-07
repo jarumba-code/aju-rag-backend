@@ -1,8 +1,13 @@
 import enum
-from sqlalchemy import Column, Integer, String, Text, DateTime, Enum, ForeignKey, Float, Boolean, JSON
+import uuid
+from datetime import datetime
+
+from typing import Any
+from sqlalchemy import Boolean, Column, DateTime, Enum, Float, ForeignKey, Index, Integer, JSON, String, Text
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from pgvector.sqlalchemy import Vector
+
 from .database import Base
 
 # --- ENUMS ---
@@ -40,9 +45,38 @@ class SystemSetting(Base):
     __tablename__ = "system_settings"
     __table_args__ = {"extend_existing": True}
 
-    key = Column(String, primary_key=True, index=True)
-    value = Column(String, nullable=False)
-    updated_at = Column(DateTime(timezone=True), server_default=func.now())
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String, unique=True, nullable=False, index=True)
+    value = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+# --- CONVERSATION MEMORY ---
+class Conversation(Base):
+    __tablename__ = "conversations"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(UUID(as_uuid=True), primary_key=True, index=True, default=uuid.uuid4)
+    persona = Column(String(50), default="public")
+    department_id = Column(Integer, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    messages = relationship("ChatMessage", back_populates="conversation", cascade="all, delete-orphan")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    __table_args__ = {"extend_existing": True}
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"), index=True, nullable=False)
+    role = Column(String(20), nullable=False)
+    content = Column(Text, nullable=False)
+    sources = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    conversation = relationship("Conversation", back_populates="messages")
+
 
 # --- CORE KNOWLEDGE ---
 class KnowledgeSource(Base):
@@ -85,32 +119,58 @@ class KnowledgeVersion(Base):
     
     source = relationship("KnowledgeSource", back_populates="versions")
 
+class Document(Base):
+    __tablename__ = "documents"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, index=True, default=uuid.uuid4)
+    title = Column(String, nullable=True)
+    filename = Column(String, nullable=True)
+    file_hash = Column(String, unique=True, nullable=False, index=True)
+    department = Column(String, nullable=True)
+    doc_type = Column(String, nullable=True)
+    source_name = Column(String, nullable=True)
+    chunk_count = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    chunks = relationship("DocumentChunk", back_populates="document", cascade="all, delete-orphan")
+
 # --- VECTOR CHUNKS ---
 class DocumentChunk(Base):
     __tablename__ = "document_chunks"
     id = Column(Integer, primary_key=True)
-    source_id = Column(Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"))
+    source_id = Column(Integer, ForeignKey("knowledge_sources.id", ondelete="CASCADE"), nullable=True)
+    document_id = Column(UUID(as_uuid=True), ForeignKey("documents.id", ondelete="CASCADE"), nullable=True)
     chunk_content = Column(Text)
     
     # Replicated for High-Speed pgvector pre-filtering
     visibility = Column(Enum(VisibilityLevel), index=True)
     department_id = Column(Integer, index=True)
-
-    # 1536-dim embedding from text-embedding-3-small
-    vector_embedding = Column(Vector(1536), nullable=True)
-
+    
+    # vector_embedding = Column(Vector(1536))
     source = relationship("KnowledgeSource", back_populates="chunks")
+    document = relationship("Document", back_populates="chunks")
 
 # --- ANALYTICS & FEEDBACK LOOPS ---
-class UnansweredQuestion(Base):
-    __tablename__ = "unanswered_questions"
-    id = Column(Integer, primary_key=True)
-    normalized_hash = Column(String, index=True)
-    sample_query = Column(Text)
-    hit_count = Column(Integer, default=1)
-    lowest_confidence = Column(Float)
-    ai_draft_suggested = Column(Text, nullable=True) # AI Draft Assistant Output
-    resolved = Column(Boolean, default=False)
+class UnansweredQuery(Base):
+    __tablename__ = "unanswered_queries"
+    __table_args__ = (
+        Index("ix_unanswered_queries_created_at", "created_at"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, index=True)
+    query_text = Column(Text, nullable=False)
+    normalized_query = Column(Text, nullable=True)
+    reason = Column(String(50), nullable=False)
+    confidence_score = Column(Float, nullable=True)
+    retrieved_documents = Column(Integer, default=0, nullable=False)
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=True, index=True)
+    user_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    metadata_json = Column("metadata", JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    resolved = Column(Boolean, default=False, nullable=False)
+    resolution_note = Column(Text, nullable=True)
+
+    conversation = relationship("Conversation")
 
 class ChatAnalytics(Base):
     __tablename__ = "chat_analytics"
