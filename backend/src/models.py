@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
+from pgvector.sqlalchemy import Vector
 from .database import Base
 
 # --- ENUMS ---
@@ -146,7 +147,7 @@ class DocumentChunk(Base):
     visibility = Column(Enum(VisibilityLevel), index=True)
     department_id = Column(Integer, index=True)
     
-    # vector_embedding = Column(Vector(1536))
+    vector_embedding = Column(Vector(1536), nullable=True)
     source = relationship("KnowledgeSource", back_populates="chunks")
     document = relationship("Document", back_populates="chunks")
 

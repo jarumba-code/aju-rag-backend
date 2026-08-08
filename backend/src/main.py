@@ -1,6 +1,8 @@
+import uuid
 from datetime import datetime
 from fastapi import FastAPI, Depends, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from sqlalchemy import desc, func, select
@@ -8,8 +10,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.database import Base, engine, get_db
-from src.models import KnowledgeSource, UnansweredQuery
-from src.rag import answer_query
+from src.models import KnowledgeSource, UnansweredQuery, VisibilityLevel, ContentStatus
+from src.rag import answer_query, stream_rag_response
+from src.services.ingest import process_and_store_document
 
 app = FastAPI(
     title="AJU Knowledge Management Platform API",
@@ -234,23 +237,69 @@ async def query_rag(payload: QueryRequest, db: AsyncSession = Depends(get_db)):
         )
 
 
+
+@app.post("/api/v1/query/stream", tags=["RAG Engine"])
+async def query_rag_stream(payload: QueryRequest, db: AsyncSession = Depends(get_db)):
+    """
+    Stream a persona-aware RAG response using Server-Sent Events.
+    Events: start, citation, metadata, token, done, error.
+    """
+    async def event_generator():
+        try:
+            async for frame in stream_rag_response(
+                db=db,
+                query=payload.query,
+                persona=payload.persona,
+                conversation_id=payload.conversation_id,
+            ):
+                yield frame
+        except Exception as exc:
+            import json
+            error_frame = f"event: error\ndata: {json.dumps({'detail': 'Internal server error during streaming.'})}\n\n"
+            yield error_frame
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.post("/api/v1/ingest", response_model=IngestResponse, status_code=status.HTTP_201_CREATED, tags=["Knowledge Base"])
 async def ingest_document(payload: IngestRequest, db: AsyncSession = Depends(get_db)):
     """
     Ingest institutional content into the PostgreSQL database.
     """
     try:
+        # Determine visibility level based on confidentiality flag
+        visibility = VisibilityLevel.STUDENT if payload.is_confidential else VisibilityLevel.PUBLIC
+
+        # 1. Create parent KnowledgeSource metadata
         new_source = KnowledgeSource(
             title=payload.title,
-            content=payload.content,
-            is_confidential=payload.is_confidential,
+            visibility=visibility,
             department_id=payload.department_id,
             category_id=payload.category_id,
-            is_active=True
+            status=ContentStatus.DRAFT
         )
         db.add(new_source)
+        await db.flush()  # Generate source ID
+
+        # 2. Process and store document text (creates Document and DocumentChunks)
+        await process_and_store_document(
+            db=db,
+            source_id=new_source.id,
+            content=payload.content,
+            visibility=visibility,
+            department_id=payload.department_id,
+            title=payload.title
+        )
+
+        # 3. Commit entire transaction if all stages succeeded
         await db.commit()
-        await db.refresh(new_source)
 
         return IngestResponse(
             message="Document ingested successfully.",

@@ -15,27 +15,13 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.models import DocumentChunk, KnowledgeSource, ContentStatus, VisibilityLevel
+from src.models import Document, DocumentChunk, KnowledgeSource, ContentStatus, VisibilityLevel
 
 load_dotenv(override=True)
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# OpenRouter embedding client (shared config with rag.py)
-# ---------------------------------------------------------------------------
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
-
-_embedding_client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-    default_headers={
-        "HTTP-Referer": "https://arthurjarvisuniversity.edu.ng",
-        "X-Title": "AJU Knowledge Management Platform",
-    },
-)
-
+from src.services.embeddings import generate_embeddings
 # ---------------------------------------------------------------------------
 # 1. Recursive Character Splitter
 # ---------------------------------------------------------------------------
@@ -140,43 +126,6 @@ def _recursive_split(
         out.extend(merged)
 
 
-# ---------------------------------------------------------------------------
-# 2. Async Batched Embedding Generation
-# ---------------------------------------------------------------------------
-EMBEDDING_BATCH_SIZE = 64  # OpenRouter / OpenAI supports up to ~2048 inputs
-
-
-async def generate_embeddings(texts: List[str]) -> List[List[float]]:
-    """
-    Generate 1536-dim embeddings for a list of texts via OpenRouter.
-    Processes in batches of EMBEDDING_BATCH_SIZE to respect API limits.
-
-    Returns a list of embedding vectors (one per input text).
-    """
-    if not texts:
-        return []
-
-    all_embeddings: List[List[float]] = []
-
-    for batch_start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
-        batch = texts[batch_start : batch_start + EMBEDDING_BATCH_SIZE]
-        try:
-            response = await _embedding_client.embeddings.create(
-                model=EMBEDDING_MODEL,
-                input=batch,
-            )
-            # Sort by index to guarantee order matches input
-            sorted_data = sorted(response.data, key=lambda d: d.index)
-            all_embeddings.extend([item.embedding for item in sorted_data])
-        except Exception as e:
-            logger.error(
-                f"Embedding batch failed (items {batch_start}-"
-                f"{batch_start + len(batch)}): {e}"
-            )
-            # Insert empty vectors so indices stay aligned
-            all_embeddings.extend([[] for _ in batch])
-
-    return all_embeddings
 
 
 # ---------------------------------------------------------------------------
@@ -189,18 +138,33 @@ async def process_and_store_document(
     content: str,
     visibility: VisibilityLevel,
     department_id: Optional[int] = None,
+    title: Optional[str] = None,
 ) -> int:
     """
     End-to-end ingestion pipeline for a single document.
 
-    1. Chunks the raw text with recursive splitting.
-    2. Generates batched embeddings via OpenRouter.
-    3. Bulk inserts DocumentChunk rows with replicated visibility & department_id.
-    4. Updates the parent KnowledgeSource status to PUBLISHED.
+    1. Checks if Document with identical hash exists to prevent duplicate ingestion.
+    2. Chunks the raw text with recursive splitting.
+    3. Generates batched embeddings via OpenRouter.
+    4. Creates and inserts Document record.
+    5. Bulk inserts DocumentChunk rows with replicated visibility & department_id.
+    6. Updates the parent KnowledgeSource status to PUBLISHED.
 
     Returns the number of chunks created.
     """
-    # --- Step 1: Chunk ---
+    # --- Step 1: Duplicate check & Hash generation ---
+    import hashlib
+    file_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    from sqlalchemy import select
+    existing_result = await db.execute(
+        select(Document).where(Document.file_hash == file_hash)
+    )
+    existing_doc = existing_result.scalar_one_or_none()
+    if existing_doc is not None:
+        raise ValueError("A document with the same content already exists.")
+
+    # --- Step 2: Chunk ---
     chunks = recursive_chunk_text(content, chunk_size=800, overlap=100)
     if not chunks:
         logger.warning(f"Source {source_id}: no chunks produced from content.")
@@ -208,14 +172,28 @@ async def process_and_store_document(
 
     logger.info(f"Source {source_id}: split into {len(chunks)} chunks.")
 
-    # --- Step 2: Embed (fire-and-forget for now — vectors stored when pgvector is ready) ---
+    # --- Step 3: Embed ---
     embeddings = await generate_embeddings(chunks)
     logger.info(f"Source {source_id}: generated {len(embeddings)} embeddings.")
 
-    # --- Step 3: Bulk persist chunks ---
+    # --- Step 4: Create Document record ---
+    document = Document(
+        title=title or f"Doc_{source_id}",
+        filename=None,
+        file_hash=file_hash,
+        department=str(department_id) if department_id is not None else None,
+        doc_type="text",
+        source_name="api_ingest",
+        chunk_count=len(chunks),
+    )
+    db.add(document)
+    await db.flush()  # Generate document ID
+
+    # --- Step 5: Bulk persist chunks ---
     chunk_objects = [
         DocumentChunk(
             source_id=source_id,
+            document_id=document.id,
             chunk_content=chunk_text,
             visibility=visibility,
             department_id=department_id,
@@ -225,7 +203,7 @@ async def process_and_store_document(
     ]
     db.add_all(chunk_objects)
 
-    # --- Step 4: Mark source as PUBLISHED ---
+    # --- Step 6: Mark source as PUBLISHED ---
     from sqlalchemy import update
 
     await db.execute(
@@ -234,8 +212,8 @@ async def process_and_store_document(
         .values(status=ContentStatus.PUBLISHED)
     )
 
-    await db.commit()
+    await db.flush()
     logger.info(
-        f"Source {source_id}: persisted {len(chunk_objects)} chunks, status → PUBLISHED."
+        f"Source {source_id}: persisted {len(chunk_objects)} chunks, status → PUBLISHED (flushed, waiting for commit)."
     )
     return len(chunk_objects)
