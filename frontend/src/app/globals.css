@@ -8,6 +8,15 @@
   }
 }
 
+/* AJU Brand Typography */
+.aju-serif {
+  font-family: var(--font-serif), Georgia, Cambria, "Times New Roman", serif;
+}
+
+.aju-sans {
+  font-family: var(--font-sans), "Helvetica Neue", Arial, sans-serif;
+}
+
 /* Custom scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
@@ -22,4 +31,23 @@
 }
 .dark ::-webkit-scrollbar-thumb {
   background: #334155;
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.4s ease-out;
+}
+
+/* AJU Card Shadows */
+.aju-card {
+  @apply bg-white rounded-xl shadow-sm border border-slate-200;
+}
+
+.aju-card-hover {
+  @apply transition-all duration-200 hover:shadow-md hover:border-gold-300;
 }

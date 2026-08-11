@@ -139,6 +139,8 @@ async def process_and_store_document(
     visibility: VisibilityLevel,
     department_id: Optional[int] = None,
     title: Optional[str] = None,
+    department: Optional[str] = None,
+    doc_type: Optional[str] = None,
 ) -> int:
     """
     End-to-end ingestion pipeline for a single document.
@@ -149,6 +151,9 @@ async def process_and_store_document(
     4. Creates and inserts Document record.
     5. Bulk inserts DocumentChunk rows with replicated visibility & department_id.
     6. Updates the parent KnowledgeSource status to PUBLISHED.
+
+    ``department`` and ``doc_type`` are optional free-text metadata stored on the
+    Document record (backward compatible — default to previous behaviour).
 
     Returns the number of chunks created.
     """
@@ -181,8 +186,8 @@ async def process_and_store_document(
         title=title or f"Doc_{source_id}",
         filename=None,
         file_hash=file_hash,
-        department=str(department_id) if department_id is not None else None,
-        doc_type="text",
+        department=department or (str(department_id) if department_id is not None else None),
+        doc_type=doc_type or "text",
         source_name="api_ingest",
         chunk_count=len(chunks),
     )

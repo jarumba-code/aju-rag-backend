@@ -16,10 +16,14 @@ Tests:
   8. Confidence score present in done event
   9. Start event emitted first
 """
+import asyncio
 import json
 import sys
+import uuid
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -30,6 +34,75 @@ from src.main import app
 # Single shared client — avoids repeated asyncpg pool teardown
 # ---------------------------------------------------------------------------
 CLIENT = TestClient(app, raise_server_exceptions=False)
+
+
+# ---------------------------------------------------------------------------
+# Hermetic harness — no live PostgreSQL/Supabase or OpenRouter traffic
+# ---------------------------------------------------------------------------
+# The RAG pipeline touches the database for conversation/history/persistence.
+# These tests verify SSE/stream behaviour, so every DB-facing seam is swapped
+# for an in-memory fake. Retrieval + LLM layers are mocked per-test.
+from src.database import get_db
+
+
+def _fake_db_dep():
+    """Stand-in for the async DB session dependency (no DB connections).
+
+    Mirrors the *real* ``AsyncSession`` method contract. In SQLAlchemy the
+    ``add``/``add_all``/``delete`` methods are **synchronous** (they only
+    schedule objects; the write is flushed when you ``await commit()``/``await
+    flush()``). ``commit``/``flush``/``execute``/``close`` are **awaitable``.
+
+    Returning a bare ``AsyncMock`` makes *every* attribute call return a
+    coroutine, so the perfectly-correct production call ``db.add_all([...])``
+    (which is intentionally NOT awaited) produced
+    ``RuntimeWarning: coroutine ... was never awaited``. This fake is what makes
+    the mocked streaming tests hermetic without touching production code.
+    """
+    db = MagicMock(name="FakeAsyncSession")
+    # Awaitable methods that production calls with `await`:
+    db.commit = AsyncMock()
+    db.flush = AsyncMock()
+    db.execute = AsyncMock(return_value=AsyncMock())
+    db.close = AsyncMock()
+    db.refresh = AsyncMock()
+    # ``add``/``add_all``/``delete`` remain plain (sync) MagicMock auto-attrs,
+    # so they return synchronously and never create un-awaited coroutines.
+    return db
+
+
+app.dependency_overrides[get_db] = _fake_db_dep
+
+
+async def _fake_get_or_create_conversation(db, conversation_id, persona, department_id):
+    """Deterministic stand-in for src.rag._get_or_create_conversation."""
+    if conversation_id:
+        try:
+            return SimpleNamespace(
+                id=uuid.UUID(conversation_id), persona=persona, department_id=department_id
+            )
+        except (ValueError, TypeError):
+            pass
+    return SimpleNamespace(id=uuid.uuid4(), persona=persona, department_id=department_id)
+
+
+@contextmanager
+def rag_harness(retrieve=None, stream=None, complete=None):
+    """Patch all RAG external seams for one request: retrieval, LLM
+    streaming/completion, conversation persistence, history, and
+    unanswered-query logging — no live DB or LLM involved."""
+    with ExitStack() as stack:
+        stack.enter_context(patch(
+            "src.rag._get_or_create_conversation", side_effect=_fake_get_or_create_conversation))
+        stack.enter_context(patch("src.rag._fetch_history", new=AsyncMock(return_value=[])))
+        stack.enter_context(patch("src.rag.log_unanswered_query", new=AsyncMock()))
+        if retrieve is not None:
+            stack.enter_context(patch("src.rag.retrieve_relevant_chunks", side_effect=retrieve))
+        if stream is not None:
+            stack.enter_context(patch("src.rag.stream_chat", side_effect=stream))
+        if complete is not None:
+            stack.enter_context(patch("src.rag.complete_chat", return_value=complete))
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -63,23 +136,26 @@ def by_type(events, event_type):
 # Mock factories
 # ---------------------------------------------------------------------------
 
-def mock_retrieve_ok(db, query, persona, department_id=None, **kw):
+async def mock_retrieve_ok(db, query, persona, department_id=None, **kw):
+    """Async stand-in for successful retrieval.
+
+    NOTE: this MUST be an ``async`` callable now. Python 3.14's ``patch()`` builds
+    an ``AsyncMock`` for async coroutine targets, which resolves a side_effect's
+    return value *without awaiting nested coroutines*. Returning an un-awaited
+    coroutine here produced ``'coroutine' object is not iterable`` at runtime.
+    """
     from src.schemas.retrieval import RetrievalResult
-    async def _inner(*a, **k):
-        return [RetrievalResult(
-            chunk_id=1, document_id="doc-1", source_id=1,
-            chunk_content="Students must register for courses before the semester deadline.",
-            similarity_score=0.82, source_title="Test Source",
-            department=None, doc_type=None, visibility="PUBLIC",
-        )]
-    import asyncio
-    return _inner(db, query, persona, department_id=department_id, **kw)
+    return [RetrievalResult(
+        chunk_id=1, document_id="doc-1", source_id=1,
+        chunk_content="Students must register for courses before the semester deadline.",
+        similarity_score=0.82, source_title="Test Source",
+        department=None, doc_type=None, visibility="PUBLIC",
+    )]
 
 
-def mock_retrieve_empty(db, query, persona, department_id=None, **kw):
-    async def _inner(*a, **k):
-        return []
-    return _inner(db, query, persona, department_id=department_id, **kw)
+async def mock_retrieve_empty(db, query, persona, department_id=None, **kw):
+    """Async stand-in for retrieval that returns no results."""
+    return []
 
 
 async def mock_stream_ok(messages, model=None, temperature=0.2):
@@ -108,8 +184,7 @@ def stream_post(payload):
 # ---------------------------------------------------------------------------
 
 def test_1_http_200_and_content_type():
-    with patch("src.rag.retrieve_relevant_chunks", side_effect=mock_retrieve_ok), \
-         patch("src.rag.stream_chat", side_effect=mock_stream_ok):
+    with rag_harness(retrieve=mock_retrieve_ok, stream=mock_stream_ok):
         resp = stream_post({"query": "test", "persona": "public"})
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
     assert "text/event-stream" in resp.headers.get("content-type", "")
@@ -117,8 +192,7 @@ def test_1_http_200_and_content_type():
 
 
 def test_2_token_events():
-    with patch("src.rag.retrieve_relevant_chunks", side_effect=mock_retrieve_ok), \
-         patch("src.rag.stream_chat", side_effect=mock_stream_ok):
+    with rag_harness(retrieve=mock_retrieve_ok, stream=mock_stream_ok):
         resp = stream_post({"query": "test", "persona": "student"})
     events = parse_sse(resp.text)
     tokens = by_type(events, "token")
@@ -129,8 +203,7 @@ def test_2_token_events():
 
 
 def test_3_done_event_structure():
-    with patch("src.rag.retrieve_relevant_chunks", side_effect=mock_retrieve_ok), \
-         patch("src.rag.stream_chat", side_effect=mock_stream_ok):
+    with rag_harness(retrieve=mock_retrieve_ok, stream=mock_stream_ok):
         resp = stream_post({"query": "test", "persona": "student"})
     events = parse_sse(resp.text)
     done_list = by_type(events, "done")
@@ -142,8 +215,7 @@ def test_3_done_event_structure():
 
 
 def test_4_citation_events():
-    with patch("src.rag.retrieve_relevant_chunks", side_effect=mock_retrieve_ok), \
-         patch("src.rag.stream_chat", side_effect=mock_stream_ok):
+    with rag_harness(retrieve=mock_retrieve_ok, stream=mock_stream_ok):
         resp = stream_post({"query": "course registration", "persona": "student"})
     events = parse_sse(resp.text)
     citations = by_type(events, "citation")
@@ -153,8 +225,7 @@ def test_4_citation_events():
 
 
 def test_5_no_result_graceful():
-    with patch("src.rag.retrieve_relevant_chunks", side_effect=mock_retrieve_empty), \
-         patch("src.rag.stream_chat", side_effect=mock_stream_ok):
+    with rag_harness(retrieve=mock_retrieve_empty, stream=mock_stream_ok):
         resp = stream_post({"query": "alien invasion mars", "persona": "public"})
     assert resp.status_code == 200
     events = parse_sse(resp.text)
@@ -167,8 +238,7 @@ def test_5_no_result_graceful():
 
 
 def test_6_llm_error_emits_error_event():
-    with patch("src.rag.retrieve_relevant_chunks", side_effect=mock_retrieve_ok), \
-         patch("src.rag.stream_chat", side_effect=mock_stream_error):
+    with rag_harness(retrieve=mock_retrieve_ok, stream=mock_stream_error):
         resp = stream_post({"query": "test", "persona": "public"})
     assert resp.status_code == 200
     events = parse_sse(resp.text)
@@ -179,8 +249,7 @@ def test_6_llm_error_emits_error_event():
 
 
 def test_7_existing_query_regression():
-    with patch("src.rag.retrieve_relevant_chunks", side_effect=mock_retrieve_ok), \
-         patch("src.rag.complete_chat", return_value=MOCK_CHAT_RESULT):
+    with rag_harness(retrieve=mock_retrieve_ok, complete=MOCK_CHAT_RESULT):
         resp = CLIENT.post("/api/v1/query", json={"query": "test", "persona": "public"})
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     data = resp.json()
@@ -190,8 +259,7 @@ def test_7_existing_query_regression():
 
 
 def test_8_confidence_score_in_stream():
-    with patch("src.rag.retrieve_relevant_chunks", side_effect=mock_retrieve_ok), \
-         patch("src.rag.stream_chat", side_effect=mock_stream_ok):
+    with rag_harness(retrieve=mock_retrieve_ok, stream=mock_stream_ok):
         resp = stream_post({"query": "test", "persona": "student"})
     events = parse_sse(resp.text)
     done = by_type(events, "done")[0]["data"]
@@ -202,8 +270,7 @@ def test_8_confidence_score_in_stream():
 
 
 def test_9_start_event_first():
-    with patch("src.rag.retrieve_relevant_chunks", side_effect=mock_retrieve_ok), \
-         patch("src.rag.stream_chat", side_effect=mock_stream_ok):
+    with rag_harness(retrieve=mock_retrieve_ok, stream=mock_stream_ok):
         resp = stream_post({"query": "test", "persona": "public"})
     events = parse_sse(resp.text)
     assert events, "No events received"
@@ -248,6 +315,18 @@ def run_all():
     return failed == 0
 
 
+async def _dispose_engine():
+    """Close pooled asyncpg connections inside a *running* event loop before the
+    process exits, avoiding "Event loop is closed" teardown crashes (asyncpg +
+    Python 3.12+). Test-only scaffolding, not application code."""
+    try:
+        from src.database import engine
+        await engine.dispose()
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     ok = run_all()
+    asyncio.run(_dispose_engine())
     sys.exit(0 if ok else 1)

@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "openai/text-embedding-3-small"
     ADMIN_API_KEY: str = ""
 
+    # Admin authentication (password-based)
+    # Store a bcrypt hash here, never the plaintext password.
+    ADMIN_PASSWORD_HASH: str = ""
+    # JWT secret for admin session tokens
+    SECRET_KEY: str = "change_this_secret_key_in_production_please"
+
     # CORS settings
     CORS_ORIGINS: str = "http://localhost:3000,https://arthurjarvisuniversity.edu.ng"
 

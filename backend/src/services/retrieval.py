@@ -15,6 +15,28 @@ logger = logging.getLogger(__name__)
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", "4"))
 RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.70"))
 
+
+def visibility_levels_for_persona(persona: str) -> List[VisibilityLevel]:
+    """
+    Map a persona to the set of visibility levels its retrieval may access.
+
+    PUBLIC  -> {PUBLIC}
+    STUDENT -> {PUBLIC, STUDENT}
+    STAFF   -> {PUBLIC, STUDENT, STAFF}
+    unknown -> {PUBLIC}  (fail closed — unknown callers only see public content)
+
+    This is the *backend* security boundary: the frontend only selects a persona;
+    the actual access decision always lives here.
+    """
+    key = (persona or "").lower()
+    if key == "student":
+        return [VisibilityLevel.PUBLIC, VisibilityLevel.STUDENT]
+    if key == "staff":
+        return [VisibilityLevel.PUBLIC, VisibilityLevel.STUDENT, VisibilityLevel.STAFF]
+    # "public" and any unrecognised persona default to public-only content.
+    return [VisibilityLevel.PUBLIC]
+
+
 async def retrieve_relevant_chunks(
     db: AsyncSession,
     query: str,
@@ -44,15 +66,9 @@ async def retrieve_relevant_chunks(
     )
 
     # 3. Access Control (Visibility Filtering)
-    if persona == "public":
-        stmt = stmt.filter(DocumentChunk.visibility == VisibilityLevel.PUBLIC)
-    elif persona == "student":
-        stmt = stmt.filter(DocumentChunk.visibility.in_([VisibilityLevel.PUBLIC, VisibilityLevel.STUDENT]))
-    elif persona == "staff":
-        stmt = stmt.filter(DocumentChunk.visibility.in_([VisibilityLevel.PUBLIC, VisibilityLevel.STUDENT, VisibilityLevel.STAFF]))
-    else:
-        # Fallback to public if unknown persona
-        stmt = stmt.filter(DocumentChunk.visibility == VisibilityLevel.PUBLIC)
+    # The persona -> visibility mapping is enforced here on the backend — this is
+    # the final security boundary, independent of anything the frontend sends.
+    stmt = stmt.filter(DocumentChunk.visibility.in_(visibility_levels_for_persona(persona)))
 
     # 4. Department Filtering
     if department_id is not None:

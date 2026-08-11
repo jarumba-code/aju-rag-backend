@@ -3,7 +3,7 @@ import os
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete
 
-from src.database import AsyncSessionLocal
+from src.database import AsyncSessionLocal, engine
 from src.models import KnowledgeSource, Document, DocumentChunk, VisibilityLevel
 from src.services.retrieval import retrieve_relevant_chunks
 from src.services.ingest import process_and_store_document
@@ -78,4 +78,10 @@ async def run_tests():
         print("\nAll tests passed successfully.")
 
 if __name__ == "__main__":
-    asyncio.run(run_tests())
+    async def _entry() -> None:
+        try:
+            await run_tests()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_entry())

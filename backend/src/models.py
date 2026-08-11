@@ -182,3 +182,18 @@ class ChatAnalytics(Base):
     similarity_score = Column(Float)
     user_feedback = Column(Integer, nullable=True) # 1 for 👍, -1 for 👎
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+# --- AUDIT LOGGING ---
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False, index=True)
+    user_role = Column(String(50), nullable=True)  # e.g. "admin", "system"
+    action = Column(String(100), nullable=False, index=True)  # e.g. "login", "logout", "password_change", "document_upload", "document_delete"
+    resource_type = Column(String(50), nullable=True)  # e.g. "document", "gap", "settings"
+    resource_id = Column(String(100), nullable=True)
+    details = Column(Text, nullable=True)  # JSON string for extra context
+    status = Column(String(20), nullable=False)  # "success", "failure", "warning"
+    ip_address = Column(String(45), nullable=True)  # IPv4/IPv6

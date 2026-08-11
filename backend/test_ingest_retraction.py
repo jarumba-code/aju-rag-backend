@@ -1,7 +1,7 @@
 import asyncio
 import uuid
 from sqlalchemy import select
-from src.database import AsyncSessionLocal
+from src.database import AsyncSessionLocal, engine
 from src.models import KnowledgeSource, Document, DocumentChunk, VisibilityLevel, ContentStatus
 from src.services.ingest import process_and_store_document
 from src.rag import retrieve_relevant_chunks
@@ -68,18 +68,18 @@ async def main():
         print("\nTesting retrieval compatibility...")
         retrieved_sources = await retrieve_relevant_chunks(
             db=session,
-            query="Arthur Jarvis Course registration",
+            query="Course registration at Arthur Jarvis University, a private university in Nigeria",
             persona="public",
-            limit=3
+            limit=3,
+            similarity_threshold=0.3,
         )
         print(f"Retrieved {len(retrieved_sources)} relevant sources.")
         found = False
-        for src in retrieved_sources:
-            print(f"  Source Title: {src.title}")
-            for c in src.chunks:
-                print(f"    Chunk text: {c.chunk_content}")
-                if source_title == src.title:
-                    found = True
+        for item in retrieved_sources:
+            print(f"  Source Title: {item.source_title} | similarity: {item.similarity_score:.3f}")
+            print(f"    Chunk text: {item.chunk_content[:80]}")
+            if source_title == item.source_title:
+                found = True
         
         if found:
             print("\nSUCCESS: Document was successfully ingested, stored, and retrieved via RAG retrieval!")
@@ -96,4 +96,10 @@ async def main():
         print("Cleanup completed.")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    async def _entry() -> None:
+        try:
+            await main()
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_entry())

@@ -1,8 +1,20 @@
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from src.db import UserQuery
+"""Suggested-question service for the AJU portal.
 
-# High-quality AJU-specific default questions to fallback to if database is empty
+Returns a curated set of high-quality AJU-specific prompts, optionally enriched
+with the most frequently asked queries already present in the existing analytics
+table (``ChatAnalytics``).
+
+This intentionally reuses the models already in the system instead of creating a
+duplicate ``UserQuery`` model (the previous ``src.db`` import did not exist).
+"""
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.models import ChatAnalytics
+
+# High-quality AJU-specific default questions to fall back to when the analytics
+# store is empty or unavailable.
 DEFAULT_QUESTIONS = [
     "What are the admission requirements for Arthur Jarvis University?",
     "What faculties and departments are available at AJU?",
@@ -14,54 +26,34 @@ DEFAULT_QUESTIONS = [
 
 async def get_suggested_questions(session: AsyncSession, limit: int = 5) -> list[str]:
     """
-    Returns popular/featured queries from the database.
-    Falls back to high-quality AJU-specific defaults if the DB is empty.
+    Return popular previously-asked queries (from ``ChatAnalytics``), padded and
+    deduplicated with the curated ``DEFAULT_QUESTIONS``.
+
+    If the analytics table is empty or unavailable, only the defaults are used.
     """
+    popular: list[str] = []
     try:
-        # Fetch top popular queries ordered by ask_count desc, featured first
         stmt = (
-            select(UserQuery.query_text)
-            .order_by(UserQuery.is_featured.desc(), UserQuery.ask_count.desc())
+            select(ChatAnalytics.query, func.count(ChatAnalytics.id).label("cnt"))
+            .where(ChatAnalytics.query.isnot(None), ChatAnalytics.query != "")
+            .group_by(ChatAnalytics.query)
+            .order_by(func.count(ChatAnalytics.id).desc(), func.max(ChatAnalytics.created_at).desc())
             .limit(limit)
         )
         result = await session.execute(stmt)
-        questions = [row[0] for row in result.all()]
-
-        if not questions:
-            return DEFAULT_QUESTIONS[:limit]
-
-        # Pad with defaults if we have fewer than limit
-        if len(questions) < limit:
-            for q in DEFAULT_QUESTIONS:
-                if q not in questions:
-                    questions.append(q)
-                if len(questions) == limit:
-                    break
-
-        return questions
+        popular = [
+            row[0].strip()
+            for row in result.all()
+            if row and row[0] and row[0].strip()
+        ]
     except Exception:
-        return DEFAULT_QUESTIONS[:limit]
+        # Any analytics failure should never break the chat UX.
+        popular = []
 
-
-async def record_user_query(session: AsyncSession, query_text: str):
-    """
-    Upserts a user query: creates a new record or increments ask_count.
-    """
-    query_text = query_text.strip()
-    if not query_text:
-        return
-
-    try:
-        stmt = select(UserQuery).where(UserQuery.query_text == query_text)
-        result = await session.execute(stmt)
-        existing = result.scalar_one_or_none()
-
-        if existing:
-            existing.ask_count += 1
-        else:
-            new_query = UserQuery(query_text=query_text, ask_count=1)
-            session.add(new_query)
-
-        await session.commit()
-    except Exception:
-        await session.rollback()
+    questions: list[str] = []
+    for question in popular + DEFAULT_QUESTIONS:
+        if question not in questions:
+            questions.append(question)
+        if len(questions) >= limit:
+            break
+    return questions

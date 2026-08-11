@@ -2,57 +2,63 @@
 
 import React, { useState } from "react";
 import ChatWidget from "../components/ChatWidget";
+import { ApiError, ingestDocument } from "../lib/api";
 
 export default function Home() {
-  const [file, setFile] = useState<File | null>(null);
+  const [title, setTitle] = useState("");
+  const [content, setContent] = useState("");
+  const [isConfidential, setIsConfidential] = useState(false);
+  const [adminKey, setAdminKey] = useState("");
   const [isUploading, setIsUploading] = useState(false);
-  const [statusMsg, setStatusMsg] = useState<{ type: "success" | "error"; text: str } | null>(null);
+  const [statusMsg, setStatusMsg] = useState<{ type: "success" | "error"; text: string } | null>(
+    null
+  );
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
-      setStatusMsg(null);
-    }
-  };
-
-  const handleUpload = async (e: React.FormEvent) => {
+  const handleIngest = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!file) return;
+    const trimmedTitle = title.trim();
+    const trimmedContent = content.trim();
+    const key = adminKey.trim();
+
+    if (!trimmedTitle || !trimmedContent) {
+      setStatusMsg({ type: "error", text: "Both a title and content are required." });
+      return;
+    }
+    if (!key) {
+      setStatusMsg({ type: "error", text: "An admin API key is required to ingest content." });
+      return;
+    }
 
     setIsUploading(true);
     setStatusMsg(null);
 
-    const formData = new FormData();
-    formData.append("file", file);
-
     try {
-      const response = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}/api/upload`,
+      await ingestDocument(
         {
-          method: "POST",
-          body: formData,
-        }
+          title: trimmedTitle,
+          content: trimmedContent,
+          is_confidential: isConfidential,
+          department_id: null,
+          category_id: null,
+        },
+        key
       );
-
-      const data = await response.json();
-
-      if (response.ok) {
-        setStatusMsg({
-          type: "success",
-          text: `Document "${file.name}" ingested successfully! It is now searchable by the AI assistant.`,
-        });
-        setFile(null);
-      } else {
-        setStatusMsg({
-          type: "error",
-          text: data.detail || "Failed to ingest the document.",
-        });
-      }
+      setStatusMsg({
+        type: "success",
+        text: `Document "${trimmedTitle}" ingested successfully! It is now searchable by the AI assistant.`,
+      });
+      setTitle("");
+      setContent("");
+      setAdminKey("");
+      setIsConfidential(false);
     } catch (err) {
       console.error(err);
       setStatusMsg({
         type: "error",
-        text: "Network error occurred. Ensure the backend is running.",
+        text:
+          err instanceof ApiError
+            ? err.message
+            : "Network error occurred. Ensure the backend is running.",
       });
     } finally {
       setIsUploading(false);
@@ -105,34 +111,71 @@ export default function Home() {
                 Ingest Portal Information
               </h2>
               <p className="text-slate-500 dark:text-slate-400 text-xs mb-6 leading-relaxed">
-                Add PDFs containing student catalogs, courses, calendars, or guides.
+                Add institutional content (policies, guides, FAQs) to the AI knowledge base.
               </p>
 
-              <form onSubmit={handleUpload} className="space-y-4">
-                <div className="border-2 border-dashed border-slate-200 dark:border-slate-800 rounded-2xl p-6 hover:border-blue-500/50 transition-colors flex flex-col items-center justify-center relative cursor-pointer group bg-slate-50/50 dark:bg-slate-950/20">
+              <form onSubmit={handleIngest} className="space-y-4">
+                <label className="block">
+                  <span className="text-xs font-semibold text-slate-600 dark:text-slate-300 mb-1 block">
+                    Document title
+                  </span>
                   <input
-                    type="file"
-                    accept=".pdf"
-                    onChange={handleFileChange}
-                    className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+                    type="text"
+                    value={title}
+                    onChange={(e) => setTitle(e.target.value)}
+                    placeholder="e.g. AJU Student Handbook 2026"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-sm text-slate-800 dark:text-slate-200 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/20"
                   />
-                  <div className="text-center">
-                    <p className="text-sm font-semibold text-slate-700 dark:text-slate-300 group-hover:text-blue-600 transition-colors">
-                      {file ? file.name : "Select school PDF"}
-                    </p>
-                    <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-1">
-                      PDF formats up to 50MB
-                    </p>
-                  </div>
-                </div>
+                </label>
+
+                <label className="block">
+                  <span className="text-xs font-semibold text-slate-600 dark:text-slate-300 mb-1 block">
+                    Content
+                  </span>
+                  <textarea
+                    value={content}
+                    onChange={(e) => setContent(e.target.value)}
+                    rows={4}
+                    placeholder="Paste the institutional text to index (academic policies, course guides, FAQs)..."
+                    className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-sm text-slate-800 dark:text-slate-200 outline-none resize-y focus:border-blue-500 focus:ring-1 focus:ring-blue-500/20"
+                  />
+                </label>
+
+                <label className="block">
+                  <span className="text-xs font-semibold text-slate-600 dark:text-slate-300 mb-1 block">
+                    Admin API key
+                  </span>
+                  <input
+                    type="password"
+                    value={adminKey}
+                    onChange={(e) => setAdminKey(e.target.value)}
+                    placeholder="Required — matches backend ADMIN_API_KEY (never stored)"
+                    autoComplete="off"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-950 text-sm text-slate-800 dark:text-slate-200 outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/20"
+                  />
+                </label>
+
+                <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={isConfidential}
+                    onChange={(e) => setIsConfidential(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                  />
+                  Student-only content (hidden from public visitors)
+                </label>
 
                 <button
                   type="submit"
-                  disabled={!file || isUploading}
-                  className="w-full py-3 px-4 rounded-xl text-sm font-bold bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 disabled:from-slate-200 disabled:to-slate-200 dark:disabled:from-slate-850 dark:disabled:to-slate-850 text-white shadow-md transition-all hover:scale-[1.01] active:scale-[0.99] disabled:scale-100 disabled:cursor-not-allowed cursor-pointer outline-none"
+                  disabled={isUploading || !title.trim() || !content.trim() || !adminKey.trim()}
+                  className="w-full py-3 px-4 rounded-xl text-sm font-bold bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 disabled:from-slate-200 disabled:to-slate-200 dark:disabled:from-slate-800 dark:disabled:to-slate-800 text-white shadow-md transition-all hover:scale-[1.01] active:scale-[0.99] disabled:scale-100 disabled:cursor-not-allowed cursor-pointer outline-none"
                 >
                   {isUploading ? "Processing Knowledge..." : "Ingest Document"}
                 </button>
+                <p className="text-[10px] text-slate-400 dark:text-slate-500 mt-1 leading-relaxed">
+                  Admin-only ingestion via POST /api/v1/ingest. The key is sent as the
+                  X-API-Key header and is never stored in the browser.
+                </p>
               </form>
             </div>
 
@@ -176,11 +219,11 @@ export default function Home() {
 
               <ol className="space-y-4 text-xs text-slate-600 dark:text-slate-400 leading-relaxed list-decimal list-inside">
                 <li>
-                  <strong className="text-slate-700 dark:text-slate-300">Upload documents:</strong> Drag or click to select documentation PDFs in the ingestion control panel.
+                  <strong className="text-slate-700 dark:text-slate-300">Ingest documents:</strong> Provide a title, paste the content, and enter the admin key in the ingestion control panel.
                 </li>
                 <li>
-                  <strong className="text-slate-700 dark:text-slate-300">Processing:</strong> The server automatically segments texts, embeds with OpenAI, and populates the pgvector table.
-                </li>
+                  <strong className="text-slate-700 dark:text-slate-300">Processing:</strong> The server automatically segments texts, embeds them, and populates the pgvector table.
+                                </li>
                 <li>
                   <strong className="text-slate-700 dark:text-slate-300">Intelligent Q&A:</strong> Click the floating bubble in the bottom right corner to invoke the chat assistant.
                 </li>
