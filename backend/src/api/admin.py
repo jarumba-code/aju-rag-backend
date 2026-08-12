@@ -2,8 +2,8 @@
 
 Security: every route in this router is protected by the shared ``X-API-Key``
 auth dependency (see ``src.main.admin_api_key_header``). The router is mounted
-in ``src.main`` *with that dependency applied*, so all admin endpoints require a
-valid admin key and are never exposed publicly.
+in ``src.main`` *with that dependency applied*, so all admin endpoints require
+a valid admin key and are never exposed publicly.
 
 Ingestion reuses the single existing ingestion pipeline
 (``process_and_store_document``) after extracting text from the uploaded PDF via
@@ -14,7 +14,7 @@ import logging
 from typing import Optional
 
 import fitz  # PyMuPDF (see backend/requirements.txt)
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -66,14 +66,13 @@ async def upload_document(
     content = _extract_pdf_text(file_bytes)
     file_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-    # Parent source metadata (public by default for admin-uploaded documents).
     source = KnowledgeSource(
         title=file.filename,
         status=ContentStatus.DRAFT,
         visibility=VisibilityLevel.PUBLIC,
     )
     session.add(source)
-    await session.flush()  # generate source ID
+    await session.flush()
 
     try:
         await process_and_store_document(
@@ -85,23 +84,21 @@ async def upload_document(
             department=department,
             doc_type=doc_type or "pdf",
         )
-    except ValueError as exc:  # duplicate-content protection from the pipeline
+    except ValueError as exc:
         await session.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
-    except Exception as exc:  # pragma: no cover - defensive path
+    except Exception as exc:
         await session.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to ingest document: {exc}",
+            detail="Failed to ingest document.",
         ) from exc
 
-    # The pipeline flushed the Document row in this same transaction.
     document = (
         await session.execute(select(Document).where(Document.file_hash == file_hash))
     ).scalar_one()
     await session.commit()
 
-    # Record audit log
     client_ip = request.client.host if request and request.client else None
     await record_audit(
         db=session,
@@ -149,7 +146,6 @@ async def delete_document(document_id: str, session: AsyncSession = Depends(get_
     if document is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
 
-    # Record audit log before deletion
     client_ip = request.client.host if request and request.client else None
     await record_audit(
         db=session,
