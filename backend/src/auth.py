@@ -1,34 +1,13 @@
-"""
-Admin authentication module for the AJU Knowledge Management Platform.
-
-Provides:
- - Password hashing / verification using bcrypt.
- - JWT-based admin session tokens.
- - FastAPI dependencies for protecting admin routes.
-
-Password policy:
- - The production password is NEVER stored in plaintext.
- - Only ``ADMIN_PASSWORD_HASH`` (a bcrypt hash) is stored in the environment.
- - Passwords are never logged or returned in API responses.
-
-Session policy:
- - Admin sessions are represented by short-lived JWT bearer tokens.
- - The frontend should store these in an HttpOnly, Secure, SameSite cookie
-   rather than localStorage to reduce XSS risk.
-"""
+"""Admin authentication for the AJU Knowledge Management Platform."""
 from __future__ import annotations
 
-import hashlib
 import hmac
 import logging
-import os
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import bcrypt
 from fastapi import Depends, HTTPException, Request, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -40,17 +19,10 @@ from src.models import SystemSetting
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 alg = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 4  # 4 hours
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 4
 ADMIN_ROLE = "admin"
 
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
 
 class LoginRequest(BaseModel):
     password: str
@@ -66,14 +38,8 @@ class MeResponse(BaseModel):
     role: Optional[str] = None
 
 
-# ---------------------------------------------------------------------------
-# Password helpers
-# ---------------------------------------------------------------------------
-
 def hash_password(password: str) -> str:
-    password_bytes = password.encode("utf-8")
-    salt = bcrypt.gensalt(rounds=12)
-    return bcrypt.hashpw(password_bytes, salt).decode("utf-8")
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("utf-8")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
@@ -82,50 +48,32 @@ def verify_password(password: str, password_hash: str) -> bool:
     except (ValueError, TypeError):
         return False
 
-# ---------------------------------------------------------------------------
-# JWT helpers
-# ---------------------------------------------------------------------------
 
 def _get_secret_key() -> str:
     key = (settings.SECRET_KEY or "").strip()
     if not key:
-        raise RuntimeError(
-            "SECRET_KEY is not configured. Set a strong secret in the environment."
-        )
+        raise RuntimeError("SECRET_KEY is not configured. Set a strong secret in the environment.")
     return key
 
 
 def create_access_token(data: dict) -> str:
-    """
-    Create a JWT access token.
-
-    Honors an existing ``exp`` / ``iat`` in *data* if supplied (useful for
-    tests). Otherwise applies the default expiration window.
-    """
-    secret = _get_secret_key()
     to_encode = data.copy()
     if "exp" not in to_encode:
         to_encode["exp"] = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     if "iat" not in to_encode:
         to_encode["iat"] = datetime.now(timezone.utc)
-    return jwt.encode(to_encode, secret, algorithm=alg)
-    return jwt.encode(to_encode, secret, algorithm=alg)
+    return jwt.encode(to_encode, _get_secret_key(), algorithm=alg)
 
 
 def decode_access_token(token: str) -> dict:
-    secret = _get_secret_key()
     try:
-        payload = jwt.decode(token, secret, algorithms=[alg])
-        return payload
+        return jwt.decode(token, _get_secret_key(), algorithms=[alg])
     except JWTError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired authentication token.",
         ) from exc
 
-# ---------------------------------------------------------------------------
-# Authentication dependencies
-# ---------------------------------------------------------------------------
 
 def _extract_bearer_token(request: Request) -> Optional[str]:
     auth_header = request.headers.get("Authorization", "")
@@ -134,7 +82,12 @@ def _extract_bearer_token(request: Request) -> Optional[str]:
     return request.headers.get("X-Admin-Token") or None
 
 
-async def require_admin_auth(request: Request) -> dict:
+async def require_admin_auth(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    # Legacy API-key authentication remains supported and intentionally bypasses
+    # password-rotation checks because the API key is independently managed.
     api_key = request.headers.get("X-API-Key")
     if api_key and settings.ADMIN_API_KEY:
         expected = settings.ADMIN_API_KEY.strip()
@@ -143,68 +96,46 @@ async def require_admin_auth(request: Request) -> dict:
 
     token = _extract_bearer_token(request)
     if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing authentication credentials.",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing authentication credentials.")
 
     payload = decode_access_token(token)
-    role = payload.get("role")
-    if role != ADMIN_ROLE:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token.",
-        )
+    if payload.get("role") != ADMIN_ROLE:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication token.")
+
+    # Password rotation invalidates JWTs issued before password_changed_at.
+    changed_result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == "password_changed_at")
+    )
+    changed_setting = changed_result.scalars().first()
+    if changed_setting and changed_setting.value:
+        try:
+            changed_at = float(changed_setting.value)
+            issued_at = float(payload.get("iat", 0))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid authentication session.")
+        if issued_at < changed_at:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session invalidated by password change.")
 
     return payload
 
-
-# ---------------------------------------------------------------------------
-# Rate-limiting hooks
-# ---------------------------------------------------------------------------
 
 def _is_rate_limited(client_ip: str) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# Core login logic
-# ---------------------------------------------------------------------------
-
 async def authenticate_admin(password: str, db: AsyncSession, client_ip: Optional[str] = None) -> dict:
     if client_ip and _is_rate_limited(client_ip):
         logger.warning("Admin login rate-limited for IP=%s", client_ip)
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many login attempts. Please try again later.",
-        )
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many login attempts. Please try again later.")
 
     result = await db.execute(select(SystemSetting).where(SystemSetting.key == "admin_password_hash"))
     hash_setting = result.scalars().first()
-    
-    if hash_setting:
-        password_hash = hash_setting.value
-    else:
-        password_hash = (settings.ADMIN_PASSWORD_HASH or "").strip()
+    password_hash = hash_setting.value if hash_setting else (settings.ADMIN_PASSWORD_HASH or "").strip()
 
-    if not password_hash:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials.",
-        )
-
-    if not verify_password(password, password_hash):
+    if not password_hash or not verify_password(password, password_hash):
         logger.warning("Admin login failed for IP=%s", client_ip)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials.",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials.")
 
     token = create_access_token({"role": ADMIN_ROLE})
     logger.info("Admin login successful for IP=%s", client_ip)
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "role": ADMIN_ROLE,
-    }
-
+    return {"access_token": token, "token_type": "bearer", "role": ADMIN_ROLE}
