@@ -1,45 +1,39 @@
-"""Admin document-management API (PDF upload, list, delete).
-
-Security: every route in this router is protected by the shared ``X-API-Key``
-auth dependency (see ``src.main.admin_api_key_header``). The router is mounted
-in ``src.main`` *with that dependency applied*, so all admin endpoints require
-a valid admin key and are never exposed publicly.
-
-Ingestion reuses the single existing ingestion pipeline
-(``process_and_store_document``) after extracting text from the uploaded PDF via
-PyMuPDF (``fitz``). No second/chunking embedding system is created here.
-"""
+"""Admin document-management API (PDF upload, list, delete)."""
 import hashlib
 import logging
 from typing import Optional
 
-import fitz  # PyMuPDF (see backend/requirements.txt)
+import fitz
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.auth import require_admin_auth
 from src.database import get_db
 from src.models import ContentStatus, Document, KnowledgeSource, VisibilityLevel
-from src.services.ingest import process_and_store_document
 from src.services.audit import record_audit
+from src.services.ingest import process_and_store_document
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/admin", tags=["admin"])
+router = APIRouter(
+    prefix="/api/v1/admin",
+    tags=["Admin Documents"],
+    dependencies=[Depends(require_admin_auth)],
+)
 
 
 def _extract_pdf_text(file_bytes: bytes) -> str:
-    """Extract plain text from raw PDF bytes using PyMuPDF."""
     try:
         with fitz.open(stream=file_bytes, filetype="pdf") as doc:
             pages = [page.get_text() for page in doc]
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unable to parse PDF: {exc}",
+            detail="Unable to parse PDF.",
         ) from exc
 
-    text = "\n\n".join(p for p in pages if p and p.strip()).strip()
+    text = "\n\n".join(page for page in pages if page and page.strip()).strip()
     if not text:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -89,15 +83,20 @@ async def upload_document(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except Exception as exc:
         await session.rollback()
+        logger.exception("Document ingestion failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to ingest document.",
         ) from exc
 
-    document = (
-        await session.execute(select(Document).where(Document.file_hash == file_hash))
-    ).scalar_one()
-    await session.commit()
+    result = await session.execute(select(Document).where(Document.file_hash == file_hash))
+    document = result.scalar_one_or_none()
+    if document is None:
+        await session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Document ingestion completed without creating a document record.",
+        )
 
     client_ip = request.client.host if request and request.client else None
     await record_audit(
@@ -107,7 +106,11 @@ async def upload_document(
         user_role="admin",
         resource_type="document",
         resource_id=str(document.id),
-        details={"filename": file.filename, "department": department, "doc_type": doc_type or "pdf"},
+        details={
+            "filename": file.filename,
+            "department": department,
+            "doc_type": doc_type or "pdf",
+        },
         ip_address=client_ip,
     )
     await session.commit()
@@ -118,6 +121,7 @@ async def upload_document(
         "filename": document.filename or document.title,
         "department": document.department,
         "doc_type": document.doc_type,
+        "chunk_count": document.chunk_count,
     }
 
 
@@ -133,14 +137,18 @@ async def list_documents(session: AsyncSession = Depends(get_db)):
             "department": document.department,
             "doc_type": document.doc_type,
             "chunk_count": document.chunk_count,
-            "created_at": document.created_at.isoformat(),
+            "created_at": document.created_at.isoformat() if document.created_at else None,
         }
         for document in documents
     ]
 
 
 @router.delete("/documents/{document_id}", summary="Delete a document and its chunks")
-async def delete_document(document_id: str, session: AsyncSession = Depends(get_db), request: Request = None):
+async def delete_document(
+    document_id: str,
+    session: AsyncSession = Depends(get_db),
+    request: Request = None,
+):
     result = await session.execute(select(Document).where(Document.id == document_id))
     document = result.scalar_one_or_none()
     if document is None:
@@ -157,7 +165,6 @@ async def delete_document(document_id: str, session: AsyncSession = Depends(get_
         details={"filename": document.filename or document.title},
         ip_address=client_ip,
     )
-
     await session.delete(document)
     await session.commit()
     return {"status": "deleted", "document_id": document_id}
