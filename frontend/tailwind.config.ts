@@ -9,6 +9,12 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
+        gold: {
+          300: "#f0d060",
+          400: "#d4af37",
+          500: "#d4af37",
+          600: "#b8962e",
+        },
         aju: {
           navy: {
             DEFAULT: "#0a1628",

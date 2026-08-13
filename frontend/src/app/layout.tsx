@@ -1,5 +1,6 @@
 import React from "react";
 import "./globals.css";
+import { PersonaProvider } from "@/context/PersonaContext";
 
 export const metadata = {
   title: "Arthur Jarvis University Smart Portal",
@@ -14,7 +15,7 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className="antialiased min-h-screen bg-slate-50 dark:bg-slate-950">
-        {children}
+        <PersonaProvider>{children}</PersonaProvider>
       </body>
     </html>
   );

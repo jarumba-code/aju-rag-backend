@@ -5,7 +5,7 @@ import { User, Bot } from "lucide-react";
 import CitationCard from "./CitationCard";
 
 export interface MessageData {
-  id: number;
+  id: string;
   role: "user" | "assistant";
   content: string;
   citations?: Array<{ source_title: string; similarity_score?: number; chunk_id?: number }>;
