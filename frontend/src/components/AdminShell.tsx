@@ -58,7 +58,7 @@ export default function AdminShell({ children }: { children: React.ReactNode }) 
   }
 
   return (
-    <div className="min-h-screen bg-slate-50">
+    <div className="min-h-screen bg-slate-50 flex">
       {sidebarOpen && (
         <div
           className="fixed inset-0 bg-black/50 z-40 lg:hidden"
@@ -66,10 +66,14 @@ export default function AdminShell({ children }: { children: React.ReactNode }) 
         />
       )}
       <aside
-        className="fixed top-0 left-0 z-50 h-screen w-64 bg-navy text-gold-100 transform transition-transform duration-300 ease-in-out lg:translate-x-0 lg:static lg:z-auto"
-        style={sidebarOpen ? { transform: "translateX(0)" } : { transform: "translateX(-100%)" }}
+        className={`
+          fixed top-0 left-0 z-50 h-screen w-64 bg-navy text-gold-100
+          transform transition-transform duration-300 ease-in-out
+          lg:static lg:z-auto lg:h-auto lg:transform-none lg:flex-shrink-0
+          ${sidebarOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"}
+        `}
       >
-        <div className="flex flex-col h-full">
+        <div className="flex flex-col h-full lg:h-screen lg:sticky lg:top-0">
           <div className="flex items-center justify-between p-6 border-b border-gold-900/30">
             <div>
               <h1 className="text-xl font-bold aju-serif text-gold-100">AJU Admin</h1>
