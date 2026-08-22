@@ -1,7 +1,6 @@
 "use client";
 
 import { useState } from "react";
-import AdminShell from "@/components/AdminShell";
 import { Users, Plus, Shield, Trash2 } from "lucide-react";
 
 interface AdminUser {
@@ -22,8 +21,7 @@ export default function UsersPage() {
   const [showAddForm, setShowAddForm] = useState(false);
 
   return (
-    <AdminShell>
-      <div className="space-y-6">
+    <div className="space-y-6">
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-2xl font-bold text-navy aju-serif">Admin Users</h1>
@@ -121,6 +119,6 @@ export default function UsersPage() {
           </table>
         </div>
       </div>
-    </AdminShell>
+
   );
 }

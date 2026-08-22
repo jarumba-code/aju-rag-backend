@@ -1,7 +1,6 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import AdminShell from "@/components/AdminShell";
 import { FileText, MessageSquare, AlertTriangle, Activity } from "lucide-react";
 import { adminAnalyticsSummary, adminAuditLog, AnalyticsSummary, AuditLogRecord } from "@/lib/adminApi";
 
@@ -57,21 +56,19 @@ export default function AdminDashboard() {
 
   if (loading) {
     return (
-      <AdminShell>
-        <div className="flex items-center justify-center h-96">
+      <div className="flex items-center justify-center h-96">
           <div className="text-center">
             <div className="w-12 h-12 border-4 border-gold-400 border-t-transparent rounded-full animate-spin mx-auto mb-4"></div>
             <p className="text-slate-600">Loading dashboard...</p>
           </div>
         </div>
-      </AdminShell>
+
     );
   }
 
   if (error) {
     return (
-      <AdminShell>
-        <div className="flex items-center justify-center h-96">
+      <div className="flex items-center justify-center h-96">
           <div className="text-center">
             <p className="text-red-600 mb-2">{error}</p>
             <button
@@ -82,13 +79,12 @@ export default function AdminDashboard() {
             </button>
           </div>
         </div>
-      </AdminShell>
+
     );
   }
 
   return (
-    <AdminShell>
-      <div className="space-y-6">
+    <div className="space-y-6">
         <div>
           <h1 className="text-2xl font-bold text-navy aju-serif">Dashboard</h1>
           <p className="text-sm text-slate-600 mt-1">Welcome to the AJU Admin Portal</p>
@@ -190,6 +186,6 @@ export default function AdminDashboard() {
           </div>
         </div>
       </div>
-    </AdminShell>
+
   );
 }
