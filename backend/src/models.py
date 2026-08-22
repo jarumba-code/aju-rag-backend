@@ -46,10 +46,11 @@ class SystemSetting(Base):
     __tablename__ = "system_settings"
     __table_args__ = {"extend_existing": True}
 
-    id = Column(Integer, primary_key=True, index=True)
-    key = Column(String, unique=True, nullable=False, index=True)
+    # NOTE: this reflects the live schema — `key` is the primary key and there
+    # is no `id` column. `updated_at` is maintained by the database server.
+    key = Column(String, primary_key=True, index=True)
     value = Column(Text, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 # --- CONVERSATION MEMORY ---
 class Conversation(Base):

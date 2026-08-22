@@ -5,9 +5,8 @@ with the most frequently asked queries already present in the existing analytics
 table (``ChatAnalytics``).
 
 This intentionally reuses the models already in the system instead of creating a
-duplicate ``UserQuery`` model (the previous ``src.db`` import did not exist).
+nonexistent ``UserQuery`` / ``src.db`` dependency.
 """
-
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
