@@ -46,7 +46,7 @@ A production-grade Retrieval-Augmented Generation (RAG) platform for intelligent
 Run the whole stack (postgres + pgvector, redis, backend, frontend) with Docker:
 
 ```bash
-cp .env.example .env      # set OPENROUTER_API_KEY, ADMIN_PASSWORD_HASH, JWT_SECRET_KEY
+cp .env.example .env      # set OPENROUTER_API_KEY, ADMIN_PASSWORD_HASH, SECRET_KEY
 docker compose up -d --build
 ```
 
