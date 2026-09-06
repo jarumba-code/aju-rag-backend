@@ -9,6 +9,24 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
+        // Flat brand palette used throughout the UI (`text-navy`, `bg-gold-500`, ...).
+        navy: {
+          DEFAULT: "#0a1628",
+          light: "#0d2347",
+          dark: "#06101c",
+        },
+        gold: {
+          50: "#fdf9ec",
+          100: "#faf0cd",
+          200: "#f4e09b",
+          300: "#eccd66",
+          400: "#e2ba43",
+          500: "#d4af37",
+          600: "#b8962e",
+          700: "#957726",
+          800: "#725b1d",
+          900: "#4f3f14",
+        },
         aju: {
           navy: {
             DEFAULT: "#0a1628",

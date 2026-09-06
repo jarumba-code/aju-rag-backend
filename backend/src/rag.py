@@ -24,11 +24,27 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database import AsyncSessionLocal
 from src.models import ChatMessage, Conversation, KnowledgeSource, SystemSetting, UnansweredQuery
+from src.schemas.retrieval import RetrievalFilters
+from src.services.cache import (
+    fingerprint_filters,
+    get_cached_response,
+    set_cached_response,
+)
 from src.services.retrieval import retrieve_relevant_chunks
 from src.services.llm import complete_chat, stream_chat, LLM_MODEL, ChatResult
 from src.services.sse import format_sse
 
 logger = logging.getLogger(__name__)
+
+# Strong references to fire-and-forget tasks, otherwise the event loop may
+# garbage-collect them before they finish.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +84,7 @@ async def log_unanswered_query(
                 retrieved_documents=retrieved_documents,
                 conversation_id=conversation_id,
                 user_id=user_id,
-                metadata=metadata,
+                metadata_json=metadata,
             )
             session.add(unanswered)
             await session.commit()
@@ -164,21 +180,47 @@ async def generate_rag_response(
     persona: str = "public",
     department_id: Optional[int] = None,
     conversation_id: Optional[str] = None,
+    filters: Optional[RetrievalFilters] = None,
 ) -> Dict[str, Any]:
     """Generate a persona-aware response and persist the conversation history."""
     t_total_start = time.perf_counter()
     normalized_query = normalize_query_text(query)
     gap_reason: Optional[str] = None
+    filters_fingerprint = fingerprint_filters(filters.fingerprint() if filters else None)
 
     # --- Conversation / history ---
     conversation = await _get_or_create_conversation(db, conversation_id, persona, department_id)
     history = await _fetch_history(db, conversation.id)
 
+    # --- Response cache ---
+    # Only the first turn of a conversation is cacheable: later turns depend on the
+    # per-conversation history, which is not part of the cache key.
+    cacheable = not history
+    if cacheable:
+        cached = await get_cached_response(normalized_query, persona, filters_fingerprint)
+        if cached:
+            db.add_all([
+                ChatMessage(conversation_id=conversation.id, role="user", content=query),
+                ChatMessage(
+                    conversation_id=conversation.id,
+                    role="assistant",
+                    content=cached["answer"],
+                    sources=cached.get("sources", []),
+                ),
+            ])
+            await db.commit()
+            logger.info("rag_telemetry cache=hit total_ms=%.1f", (time.perf_counter() - t_total_start) * 1000)
+            return {
+                **cached,
+                "conversation_id": str(conversation.id),
+                "cached": True,
+            }
+
     # --- Retrieval ---
     t_retrieval_start = time.perf_counter()
     try:
         retrieved_chunks = await retrieve_relevant_chunks(
-            db, query=query, persona=persona, department_id=department_id
+            db, query=query, persona=persona, department_id=department_id, filters=filters
         )
     except Exception as exc:
         logger.error("Retrieval failed: %s", exc)
@@ -230,7 +272,7 @@ async def generate_rag_response(
 
     # --- Log unanswered ---
     if gap_reason:
-        asyncio.create_task(
+        _spawn_background(
             log_unanswered_query(
                 query_text=query,
                 normalized_query=normalized_query,
@@ -250,12 +292,27 @@ async def generate_rag_response(
     ])
     await db.commit()
 
+    # Only successful, grounded answers are cached — errors and gaps must be retried.
+    if cacheable and not gap_reason and retrieved_chunks:
+        await set_cached_response(
+            normalized_query,
+            persona,
+            filters_fingerprint,
+            {
+                "answer": answer_text,
+                "sources": source_titles,
+                "confidence_met": True,
+                "confidence_score": confidence_score,
+            },
+        )
+
     return {
         "answer": answer_text,
         "sources": source_titles,
         "conversation_id": str(conversation.id),
         "confidence_met": bool(retrieved_chunks),
         "confidence_score": confidence_score,
+        "cached": False,
         "telemetry": {
             "retrieval_latency_ms": round(retrieval_latency_ms, 1),
             "prompt_build_latency_ms": round(prompt_build_latency_ms, 1),
@@ -279,6 +336,7 @@ async def stream_rag_response(
     persona: str = "public",
     department_id: Optional[int] = None,
     conversation_id: Optional[str] = None,
+    filters: Optional[RetrievalFilters] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Async generator yielding SSE frames for the streaming endpoint.
@@ -300,7 +358,7 @@ async def stream_rag_response(
     t_retrieval_start = time.perf_counter()
     try:
         retrieved_chunks = await retrieve_relevant_chunks(
-            db, query=query, persona=persona, department_id=department_id
+            db, query=query, persona=persona, department_id=department_id, filters=filters
         )
     except Exception as exc:
         logger.error("Streaming retrieval failed: %s", exc)
@@ -384,7 +442,7 @@ async def stream_rag_response(
 
     # --- Log unanswered ---
     if gap_reason:
-        asyncio.create_task(
+        _spawn_background(
             log_unanswered_query(
                 query_text=query,
                 normalized_query=normalized_query,
@@ -441,6 +499,7 @@ async def answer_query(
     persona: str = "public",
     department_id: Optional[int] = None,
     conversation_id: Optional[str] = None,
+    filters: Optional[RetrievalFilters] = None,
 ) -> Dict[str, Any]:
     """Backward-compatible wrapper around generate_rag_response."""
     return await generate_rag_response(
@@ -449,4 +508,5 @@ async def answer_query(
         persona=persona,
         department_id=department_id,
         conversation_id=conversation_id,
+        filters=filters,
     )
