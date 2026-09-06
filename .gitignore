@@ -36,3 +36,6 @@ docker/data/
 # Logs
 *.log
 logs/
+
+# Build artifacts
+tsconfig.tsbuildinfo

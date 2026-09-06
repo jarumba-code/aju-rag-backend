@@ -1,12 +1,27 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const BACKEND = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+/**
+ * Server-side origin of the FastAPI backend. Admin routes always pass full
+ * paths (`/api/v1/...`), so any `/api/v1` suffix on the configured value is
+ * stripped here to avoid requesting `/api/v1/api/v1/...`.
+ *
+ * `BACKEND_INTERNAL_URL` wins when set (container-to-container networking);
+ * `NEXT_PUBLIC_API_URL` is the browser-facing fallback.
+ */
+const BACKEND = (
+  process.env.BACKEND_INTERNAL_URL ??
+  process.env.NEXT_PUBLIC_API_URL ??
+  "http://localhost:8000"
+)
+  .trim()
+  .replace(/\/+$/, "")
+  .replace(/\/api\/v1$/, "");
 const COOKIE_NAME = "aju_admin_token";
 
 /** Shared helper: proxy a request to FastAPI admin auth, set/clear cookie. */
 export async function proxyToBackend(
   path: string,
-  init: RequestInit
+  init: RequestInit = {}
 ): Promise<Response> {
   return fetch(`${BACKEND}${path}`, {
     ...init,

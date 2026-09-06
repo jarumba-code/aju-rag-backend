@@ -5,30 +5,28 @@ A production-grade Retrieval-Augmented Generation (RAG) platform for intelligent
 ## Architecture
 
 ```
-├── backend/          # FastAPI backend
-│   ├── alembic/      # Database migrations
+├── backend/              # FastAPI backend
+│   ├── Dockerfile
+│   ├── src/
+│   │   ├── api/          # Admin REST API
+│   │   ├── schemas/      # Pydantic schemas (retrieval filters, results)
+│   │   ├── services/     # RAG services
+│   │   │   ├── embeddings.py  # OpenRouter embeddings + Redis cache
+│   │   │   ├── retrieval.py   # pgvector search + metadata filters
+│   │   │   ├── cache.py       # Embedding & response caching
+│   │   │   └── rate_limit.py  # Per-IP rate limiting middleware
+│   │   ├── auth.py       # JWT / API-key admin auth
+│   │   ├── models.py     # SQLAlchemy models
+│   │   ├── rag.py        # RAG orchestration
+│   │   └── main.py       # App entrypoint
+│   └── tests/            # Pytest suite
+├── frontend/             # Next.js frontend
+│   ├── Dockerfile
 │   └── src/
-│       ├── api/      # REST API (v1 + middlewares)
-│       ├── core/     # Config, auth, settings
-│       ├── db/       # Database models & sessions
-│       ├── pipelines/# Ingestion & query pipelines
-│       └── services/ # Core RAG services
-│           ├── parsing/     # Document parsing (PDF, DOCX, etc.)
-│           ├── chunking/    # Text chunking strategies
-│           ├── embeddings/  # Embedding model integrations
-│           ├── vectorstore/ # Vector DB operations
-│           ├── reranking/   # Result reranking
-│           └── llm/         # LLM provider integrations
-├── frontend/         # Next.js frontend
-│   └── src/
-│       ├── app/      # App router (dashboard, auth, API routes)
+│       ├── app/          # App router (chat, admin, API routes)
 │       ├── components/
-│       ├── hooks/
 │       └── lib/
-├── docker/           # Docker Compose & Dockerfiles
-├── docs/             # Documentation
-├── scripts/          # Utility scripts
-└── .github/workflows/# CI/CD pipelines
+└── docker-compose.yml    # Full stack: postgres/pgvector, redis, backend, frontend
 ```
 
 ## Tech Stack
@@ -45,19 +43,35 @@ A production-grade Retrieval-Augmented Generation (RAG) platform for intelligent
 
 ## Quick Start
 
+Run the whole stack (postgres + pgvector, redis, backend, frontend) with Docker:
+
 ```bash
-# 1. Copy environment variables
-cp .env.example .env
+cp .env.example .env      # set OPENROUTER_API_KEY, ADMIN_PASSWORD_HASH, SECRET_KEY
+docker compose up -d --build
+```
 
-# 2. Start infrastructure
-docker compose -f docker/docker-compose.yml up -d
+Frontend: http://localhost:3000 · API docs: http://localhost:8000/docs
 
-# 3. Start backend
-cd backend && pip install -r requirements.txt && uvicorn src.main:app --reload
+Local development without containers:
 
-# 4. Start frontend
+```bash
+docker compose up -d postgres redis
+cd backend && pip install -r requirements-dev.txt && uvicorn src.main:app --reload
 cd frontend && npm install && npm run dev
 ```
+
+Backend tests: `cd backend && pytest`
+
+## Operational features
+
+| Feature | Details |
+| ------- | ------- |
+| Rate limiting | `RATE_LIMIT_REQUESTS` (default 10) per IP per `RATE_LIMIT_WINDOW_SECONDS` (default 60) on every API endpoint; stricter throttle on admin login |
+| Metadata-filtered retrieval | `filters` on `/api/v1/query`: `department`, `department_id`, `doc_type`, `document_ids`, `source_ids`, `created_after`, `created_before` — applied in SQL before vector top-k |
+| Embedding cache | SHA-256 keyed Redis cache; only cache misses hit the provider |
+| Response cache | Keyed by normalized query + persona + filters, invalidated on ingestion/deletion |
+
+Caching and rate limiting fail open when Redis is unavailable.
 
 ## License
 

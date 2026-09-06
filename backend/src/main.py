@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
@@ -5,14 +6,25 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.database import Base, engine, get_db
-from src.models import KnowledgeSource, UnansweredQuery, VisibilityLevel, ContentStatus, Document, ChatAnalytics
+from src.models import (
+    ChatAnalytics,
+    ContentStatus,
+    Document,
+    DocumentChunk,
+    KnowledgeSource,
+    UnansweredQuery,
+    VisibilityLevel,
+)
 from src.rag import answer_query, stream_rag_response
+from src.schemas.retrieval import RetrievalFilters
+from src.services.cache import close_redis, invalidate_response_cache
 from src.services.ingest import process_and_store_document
+from src.services.rate_limit import RateLimitMiddleware
 from src.services.audit import record_audit, get_audit_logs
 from src.suggested_questions import get_suggested_questions
 from src.api.admin import router as admin_router
@@ -35,6 +47,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Per-IP rate limiting for every endpoint (health/docs excluded).
+app.add_middleware(RateLimitMiddleware)
+
 
 # --- Schemas ---
 
@@ -42,6 +57,10 @@ class QueryRequest(BaseModel):
     query: str = Field(..., example="What are the admission requirements for Software Engineering?")
     persona: str = Field("public", example="student")  # 'public' or 'student'
     conversation_id: Optional[str] = Field(default=None, example="123e4567-e89b-12d3-a456-426614174000")
+    filters: Optional[RetrievalFilters] = Field(
+        default=None,
+        description="Optional metadata filters (department, doc_type, ingestion date range, ids).",
+    )
 
 
 class QueryResponse(BaseModel):
@@ -49,6 +68,8 @@ class QueryResponse(BaseModel):
     sources: List[str]
     conversation_id: str
     confidence_met: bool
+    confidence_score: Optional[float] = None
+    cached: bool = False
 
 
 class IngestRequest(BaseModel):
@@ -210,7 +231,14 @@ async def change_password(payload: ChangePasswordRequest, request: Request, db: 
 @app.on_event("startup")
 async def startup_event():
     async with engine.begin() as conn:
+        # Vector columns cannot be created before the pgvector extension exists.
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await close_redis()
 
 
 def admin_api_key_header(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
@@ -273,7 +301,7 @@ async def get_unanswered_gaps(
                 "retrieved_documents": gap.retrieved_documents,
                 "conversation_id": str(gap.conversation_id) if gap.conversation_id else None,
                 "user_id": str(gap.user_id) if gap.user_id else None,
-                "metadata": gap.metadata,
+                "metadata": gap.metadata_json,
                 "created_at": gap.created_at.isoformat() if gap.created_at else None,
                 "resolved": gap.resolved,
                 "resolution_note": gap.resolution_note,
@@ -356,12 +384,14 @@ async def query_rag(payload: QueryRequest, db: AsyncSession = Depends(get_db)):
             query=payload.query,
             persona=payload.persona,
             conversation_id=payload.conversation_id,
+            filters=payload.filters,
         )
-        return QueryResponse(**result)
+        return QueryResponse(**{key: result[key] for key in QueryResponse.model_fields if key in result})
     except Exception as e:
+        logging.getLogger(__name__).exception("Query execution failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Query execution failed: {str(e)}"
+            detail="Query execution failed."
         )
 
 
@@ -379,6 +409,7 @@ async def query_rag_stream(payload: QueryRequest, db: AsyncSession = Depends(get
                 query=payload.query,
                 persona=payload.persona,
                 conversation_id=payload.conversation_id,
+                filters=payload.filters,
             ):
                 yield frame
         except Exception as exc:
@@ -441,15 +472,19 @@ async def ingest_document(
         # 3. Commit entire transaction if all stages succeeded
         await db.commit()
 
+        # New content can change any previously cached answer.
+        await invalidate_response_cache()
+
         return IngestResponse(
             message="Document ingested successfully.",
             source_id=new_source.id
         )
     except Exception as e:
         await db.rollback()
+        logging.getLogger(__name__).exception("Ingestion failed")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Ingestion failed: {str(e)}"
+            detail="Ingestion failed."
         )
 
 

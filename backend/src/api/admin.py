@@ -14,12 +14,13 @@ import logging
 from typing import Optional
 
 import fitz  # PyMuPDF (see backend/requirements.txt)
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.database import get_db
 from src.models import ContentStatus, Document, KnowledgeSource, VisibilityLevel
+from src.services.cache import invalidate_response_cache
 from src.services.ingest import process_and_store_document
 from src.services.audit import record_audit
 
@@ -115,6 +116,9 @@ async def upload_document(
     )
     await session.commit()
 
+    # Cached answers were computed without this document.
+    await invalidate_response_cache()
+
     return {
         "status": "success",
         "document_id": str(document.id),
@@ -164,4 +168,8 @@ async def delete_document(document_id: str, session: AsyncSession = Depends(get_
 
     await session.delete(document)
     await session.commit()
+
+    # Cached answers may cite the removed document.
+    await invalidate_response_cache()
+
     return {"status": "deleted", "document_id": document_id}

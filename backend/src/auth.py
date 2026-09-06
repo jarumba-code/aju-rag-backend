@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import settings
 from src.database import get_db
 from src.models import SystemSetting
+from src.services.rate_limit import check_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,6 @@ def create_access_token(data: dict) -> str:
     if "iat" not in to_encode:
         to_encode["iat"] = datetime.now(timezone.utc)
     return jwt.encode(to_encode, secret, algorithm=alg)
-    return jwt.encode(to_encode, secret, algorithm=alg)
 
 
 def decode_access_token(token: str) -> dict:
@@ -163,8 +163,21 @@ async def require_admin_auth(request: Request) -> dict:
 # Rate-limiting hooks
 # ---------------------------------------------------------------------------
 
-def _is_rate_limited(client_ip: str) -> bool:
-    return False
+LOGIN_ATTEMPT_LIMIT = int(os.getenv("LOGIN_ATTEMPT_LIMIT", "5"))
+LOGIN_ATTEMPT_WINDOW_SECONDS = int(os.getenv("LOGIN_ATTEMPT_WINDOW_SECONDS", "300"))
+
+
+async def _is_rate_limited(client_ip: str) -> bool:
+    """
+    Throttle password guessing per IP, independently of (and stricter than) the
+    global API rate limit, using the same Redis-or-local counter backend.
+    """
+    allowed, _, _ = await check_rate_limit(
+        f"login:{client_ip}",
+        limit=LOGIN_ATTEMPT_LIMIT,
+        window_seconds=LOGIN_ATTEMPT_WINDOW_SECONDS,
+    )
+    return not allowed
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +185,7 @@ def _is_rate_limited(client_ip: str) -> bool:
 # ---------------------------------------------------------------------------
 
 async def authenticate_admin(password: str, db: AsyncSession, client_ip: Optional[str] = None) -> dict:
-    if client_ip and _is_rate_limited(client_ip):
+    if client_ip and await _is_rate_limited(client_ip):
         logger.warning("Admin login rate-limited for IP=%s", client_ip)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,

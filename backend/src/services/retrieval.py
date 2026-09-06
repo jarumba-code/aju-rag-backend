@@ -2,12 +2,12 @@ import logging
 import os
 from typing import List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.models import DocumentChunk, VisibilityLevel
-from src.schemas.retrieval import RetrievalResult
+from src.models import Document, DocumentChunk, VisibilityLevel
+from src.schemas.retrieval import RetrievalFilters, RetrievalResult
 from src.services.embeddings import generate_embeddings
 
 logger = logging.getLogger(__name__)
@@ -37,6 +37,43 @@ def visibility_levels_for_persona(persona: str) -> List[VisibilityLevel]:
     return [VisibilityLevel.PUBLIC]
 
 
+def _apply_metadata_filters(stmt, filters: RetrievalFilters):
+    """
+    Narrow the candidate set by document metadata before the top-k cut.
+
+    Document-level attributes live on ``documents``; chunk-level ones are replicated
+    onto ``document_chunks``, so only the document-level predicates need the join.
+    """
+    needs_document_join = any(
+        value is not None
+        for value in (
+            filters.department,
+            filters.doc_type,
+            filters.created_after,
+            filters.created_before,
+        )
+    )
+    if needs_document_join:
+        stmt = stmt.join(Document, DocumentChunk.document_id == Document.id)
+
+    if filters.department is not None:
+        stmt = stmt.filter(func.lower(Document.department) == filters.department.lower())
+    if filters.doc_type is not None:
+        stmt = stmt.filter(func.lower(Document.doc_type) == filters.doc_type.lower())
+    if filters.created_after is not None:
+        stmt = stmt.filter(Document.created_at >= filters.created_after)
+    if filters.created_before is not None:
+        stmt = stmt.filter(Document.created_at <= filters.created_before)
+    if filters.department_id is not None:
+        stmt = stmt.filter(DocumentChunk.department_id == filters.department_id)
+    if filters.document_ids:
+        stmt = stmt.filter(DocumentChunk.document_id.in_(filters.document_ids))
+    if filters.source_ids:
+        stmt = stmt.filter(DocumentChunk.source_id.in_(filters.source_ids))
+
+    return stmt
+
+
 async def retrieve_relevant_chunks(
     db: AsyncSession,
     query: str,
@@ -44,9 +81,10 @@ async def retrieve_relevant_chunks(
     department_id: Optional[int] = None,
     limit: int = RAG_TOP_K,
     similarity_threshold: float = RAG_SIMILARITY_THRESHOLD,
+    filters: Optional[RetrievalFilters] = None,
 ) -> List[RetrievalResult]:
     """
-    Perform pgvector semantic similarity search.
+    Perform pgvector semantic similarity search, optionally narrowed by metadata.
     """
     # 1. Generate query embedding
     query_embeddings = await generate_embeddings([query])
@@ -73,7 +111,11 @@ async def retrieve_relevant_chunks(
     # 4. Department Filtering
     if department_id is not None:
         stmt = stmt.filter(DocumentChunk.department_id == department_id)
-        
+
+    # 4b. Metadata Filtering (department name, doc type, ingestion date, ids)
+    if filters is not None and not filters.is_empty():
+        stmt = _apply_metadata_filters(stmt, filters)
+
     # 5. Threshold and Ordering
     stmt = stmt.filter(similarity_col >= similarity_threshold)
     stmt = stmt.order_by(similarity_col.desc())
@@ -108,5 +150,11 @@ async def retrieve_relevant_chunks(
             )
         )
     
-    logger.info(f"Retrieved {len(retrieval_results)} chunks for query (Top-K: {limit}, Threshold: {similarity_threshold})")
+    logger.info(
+        "Retrieved %d chunks for query (Top-K: %d, Threshold: %.2f, Filters: %s)",
+        len(retrieval_results),
+        limit,
+        similarity_threshold,
+        filters.fingerprint() if filters is not None else {},
+    )
     return retrieval_results
