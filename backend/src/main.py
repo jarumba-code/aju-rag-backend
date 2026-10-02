@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.database import Base, engine, get_db
-from src.models import KnowledgeSource, UnansweredQuery, VisibilityLevel, ContentStatus, Document, ChatAnalytics
+from src.models import KnowledgeSource, UnansweredQuery, VisibilityLevel, ContentStatus, Document, DocumentChunk, ChatAnalytics
 from src.rag import answer_query, stream_rag_response
 from src.services.ingest import process_and_store_document
 from src.services.audit import record_audit, get_audit_logs

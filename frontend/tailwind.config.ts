@@ -9,6 +9,26 @@ const config: Config = {
   theme: {
     extend: {
       colors: {
+        // Top-level brand palettes used directly by components
+        // (e.g. text-navy, bg-gold-600, hover:border-gold-300).
+        navy: {
+          DEFAULT: "#0a1628",
+          light: "#0d2347",
+          dark: "#06101c",
+        },
+        gold: {
+          DEFAULT: "#d4af37",
+          50: "#fbf9eb",
+          100: "#f6efc9",
+          200: "#eedd9e",
+          300: "#e5cb6f",
+          400: "#dcc04a",
+          500: "#d4af37",
+          600: "#b8962e",
+          700: "#96771f",
+          800: "#6e5a1c",
+          900: "#4f4218",
+        },
         aju: {
           navy: {
             DEFAULT: "#0a1628",

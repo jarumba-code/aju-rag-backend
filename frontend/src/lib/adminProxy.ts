@@ -6,7 +6,7 @@ const COOKIE_NAME = "aju_admin_token";
 /** Shared helper: proxy a request to FastAPI admin auth, set/clear cookie. */
 export async function proxyToBackend(
   path: string,
-  init: RequestInit
+  init: RequestInit = {}
 ): Promise<Response> {
   return fetch(`${BACKEND}${path}`, {
     ...init,

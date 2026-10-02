@@ -1,0 +1,7 @@
+# Keep single-container Linux assets LF-only on every platform so the
+# built image always receives valid shell scripts and config files.
+/docker/*.sh text eol=lf
+/docker/*.py text eol=lf
+/docker/*.conf text eol=lf
+/Dockerfile text eol=lf
+/.dockerignore text eol=lf

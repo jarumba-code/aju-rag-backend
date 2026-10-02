@@ -1,0 +1,26 @@
+# Build context exclusions for the aju-rag single-container image.
+# Keeps build context small and guarantees no secrets/dev artefacts leak in.
+.git/
+.gitignore
+.env
+.env.*
+*.env
+!.env.example
+backend/.env
+**/__pycache__/
+**/*.py[cod]
+.venv/
+venv/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+*.log
+logs/
+docker/data/
+docs/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

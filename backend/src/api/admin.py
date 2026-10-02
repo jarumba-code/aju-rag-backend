@@ -14,7 +14,7 @@ import logging
 from typing import Optional
 
 import fitz  # PyMuPDF (see backend/requirements.txt)
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
